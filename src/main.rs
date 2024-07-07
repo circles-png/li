@@ -1,9 +1,9 @@
-use std::fmt::{self, Display, Formatter};
-
 use colored::Colorize;
 use human_panic::{setup_panic, Metadata};
+use indexmap::IndexMap;
 use itertools::Itertools;
 use rustyline::{error::ReadlineError, DefaultEditor};
+use std::fmt::{self, Display, Formatter};
 use thiserror::Error;
 
 fn main() {
@@ -248,19 +248,51 @@ impl Display for Token {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct List(Vec<Type>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum HashMapKey {
+    Keyword(String),
+    String(String),
+}
+
+impl Display for HashMapKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Keyword(keyword) => format!(":{keyword}"),
+                Self::String(string) => format!("\"{string}\""),
+            }
+        )
+    }
+}
+
+impl TryFrom<Type> for HashMapKey {
+    type Error = Error;
+    fn try_from(value: Type) -> Result<Self, Self::Error> {
+        Ok(match value {
+            Type::Keyword(keyword) => Self::Keyword(keyword),
+            Type::String(string) => Self::String(string),
+            _ => return Err(Error::BadHashMapKey(value)),
+        })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Type {
-    Compound(List),
+    List(Vec<Type>),
+    Vector(Vec<Type>),
+    HashMap(IndexMap<HashMapKey, Type>),
     Symbol(Token),
     String(String),
     Number(f64),
     Nil,
     True,
     False,
+    Keyword(String),
 }
+
+impl Eq for Type {}
 
 #[derive(Debug, Error)]
 enum Error {
@@ -270,6 +302,10 @@ enum Error {
     UnbalancedString,
     #[error(r#"bad escape (expected one of '\n', '\\', '\"', got {0})"#)]
     BadEscape(String),
+    #[error("missing value in hash-map (found key {0}, but no value)")]
+    MissingHashMapValue(HashMapKey),
+    #[error("bad key in hash-map (found {0}, expected a keyword or string)")]
+    BadHashMapKey(Type),
 }
 
 impl Display for Type {
@@ -282,7 +318,7 @@ impl Display for Type {
                 Self::Nil => "nil".to_string(),
                 Self::True => "true".to_string(),
                 Self::False => "false".to_string(),
-                Self::Compound(List(items)) => format!(
+                Self::List(items) => format!(
                     "({})",
                     items
                         .iter()
@@ -290,6 +326,23 @@ impl Display for Type {
                         .collect_vec()
                         .join(" ")
                 ),
+                Self::Vector(items) => format!(
+                    "[{}]",
+                    items
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect_vec()
+                        .join(" ")
+                ),
+                Self::HashMap(items) => format!(
+                    "{{{}}}",
+                    items
+                        .iter()
+                        .flat_map(|(key, value)| [key.to_string(), value.to_string()])
+                        .collect_vec()
+                        .join(" ")
+                ),
+                Self::Keyword(string) => format!(":{string}"),
             }
         })
     }
@@ -300,13 +353,63 @@ impl Type {
         let first = input.first().ok_or(Error::UnexpectedEof)?;
         Ok(match first {
             Token::LeftRound => {
-                let (list, len) = List::from_tokens(input)?;
-                (Self::Compound(list), len)
+                let original_len = input.len();
+                let mut input = &input[1..];
+                let mut items = Vec::new();
+                loop {
+                    if *input.first().ok_or(Error::UnexpectedEof)? == Token::RightRound {
+                        break;
+                    }
+                    let (item, len) = Self::from_tokens(input)?;
+                    input = &input[len..];
+                    items.push(item);
+                }
+                (Self::List(items), original_len - input.len() + 1)
+            }
+            Token::LeftSquare => {
+                let original_len = input.len();
+                let mut input = &input[1..];
+                let mut items = Vec::new();
+                loop {
+                    if *input.first().ok_or(Error::UnexpectedEof)? == Token::RightSquare {
+                        break;
+                    }
+                    let (item, len) = Self::from_tokens(input)?;
+                    input = &input[len..];
+                    items.push(item);
+                }
+                (Self::Vector(items), original_len - input.len() + 1)
+            }
+            Token::LeftBrace => {
+                let original_len = input.len();
+                let mut input = &input[1..];
+                let mut items = IndexMap::new();
+                let mut key = None;
+                loop {
+                    if *input.first().ok_or(Error::UnexpectedEof)? == Token::RightBrace {
+                        break;
+                    }
+                    let (item, len) = Self::from_tokens(input)?;
+                    input = &input[len..];
+                    match key {
+                        None => {
+                            key = Some(HashMapKey::try_from(item)?);
+                        }
+                        Some(k) => {
+                            key = None;
+                            items.insert(k, item);
+                        }
+                    }
+                }
+                if let Some(key) = key {
+                    return Err(Error::MissingHashMapValue(key));
+                }
+                (Self::HashMap(items), original_len - input.len() + 1)
             }
             Token::SingleQuote | Token::Backtick | Token::Tilde | Token::TildeAt => {
                 let (parameter, len) = Self::from_tokens(&input[1..])?;
                 (
-                    Self::Compound(List(vec![
+                    Self::List(vec![
                         Self::Symbol(Token::Normal(
                             match first {
                                 Token::SingleQuote => "quote",
@@ -318,7 +421,7 @@ impl Type {
                             .to_string(),
                         )),
                         parameter,
-                    ])),
+                    ]),
                     len + 1,
                 )
             }
@@ -333,6 +436,9 @@ impl Type {
                             "nil" => Self::Nil,
                             "true" => Self::True,
                             "false" => Self::False,
+                            string if string.starts_with(':') => {
+                                Self::Keyword(string[1..].to_string())
+                            }
                             _ => Self::Symbol(Token::Normal(string.clone())),
                         },
                         Self::Number,
@@ -342,22 +448,5 @@ impl Type {
                 1,
             ),
         })
-    }
-}
-
-impl List {
-    fn from_tokens(input: &[Token]) -> Result<(Self, usize), Error> {
-        let original_len = input.len();
-        let mut input = &input[1..];
-        let mut items = Vec::new();
-        loop {
-            if *input.first().ok_or(Error::UnexpectedEof)? == Token::RightRound {
-                break;
-            }
-            let (item, len) = Type::from_tokens(input)?;
-            input = &input[len..];
-            items.push(item);
-        }
-        Ok((Self(items), original_len - input.len() + 1))
     }
 }
