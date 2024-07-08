@@ -101,61 +101,67 @@ where
     }
 }
 
-fn eval_ast<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
-where
-    F: Fn(f64, f64) -> f64 + Clone,
-{
-    Ok(match ast {
-        Type::Symbol(symbol) => EvalResult::Function(
-            environment
-                .get(&symbol.to_string().as_str())
-                .ok_or(Error::BadOperator(symbol.to_string()))?
-                .clone(),
-        ),
-        Type::List(list) => EvalResult::List(
-            list.iter()
-                .map(|item| eval(item.clone(), environment))
-                .try_collect()?,
-        ),
-        Type::Vector(vector) => EvalResult::Type(Type::Vector(
-            vector
-                .into_iter()
-                .map(|item| {
-                    eval(item, environment).map(|result| result.as_type().unwrap().clone())
-                })
-                .try_collect()?,
-        )),
-        Type::HashMap(hash_map) => EvalResult::Type(Type::HashMap(
-            hash_map
-                .into_iter()
-                .map(|(key, value)| {
-                    eval(value, environment)
-                        .map(|value| (key, value.as_type().unwrap().clone()))
-                })
-                .try_collect()?,
-        )),
-        _ => EvalResult::Type(ast.clone()),
-    })
-}
 fn eval<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
 where
     F: Fn(f64, f64) -> f64 + Clone,
 {
-    Ok(match ast {
-        Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
-        Type::List(_) => {
-            let result = eval_ast(ast, environment)?;
-            let list = result.as_list().unwrap();
-            EvalResult::Type(Type::Number(
+    fn eval<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
+    where
+        F: Fn(f64, f64) -> f64 + Clone,
+    {
+        Ok(match ast {
+            Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
+            Type::List(_) => {
+                let result = eval_ast(ast, environment)?;
+                let list = result.as_list().unwrap();
+                EvalResult::Type(Type::Number(
+                    list.iter()
+                        .skip(1)
+                        .map(|item| *item.as_type().unwrap().as_number().unwrap())
+                        .reduce(list.first().unwrap().as_function().unwrap())
+                        .unwrap(),
+                ))
+            }
+            _ => eval_ast(ast, environment)?,
+        })
+    }
+    fn eval_ast<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
+    where
+        F: Fn(f64, f64) -> f64 + Clone,
+    {
+        Ok(match ast {
+            Type::Symbol(symbol) => EvalResult::Function(
+                environment
+                    .get(&symbol.to_string().as_str())
+                    .ok_or(Error::BadOperator(symbol.to_string()))?
+                    .clone(),
+            ),
+            Type::List(list) => EvalResult::List(
                 list.iter()
-                    .skip(1)
-                    .map(|item| *item.as_type().unwrap().as_number().unwrap())
-                    .reduce(list.first().unwrap().as_function().unwrap())
-                    .unwrap(),
-            ))
-        }
-        _ => eval_ast(ast, environment)?,
-    })
+                    .map(|item| eval(item.clone(), environment))
+                    .try_collect()?,
+            ),
+            Type::Vector(vector) => EvalResult::Type(Type::Vector(
+                vector
+                    .into_iter()
+                    .map(|item| {
+                        eval(item, environment).map(|result| result.as_type().unwrap().clone())
+                    })
+                    .try_collect()?,
+            )),
+            Type::HashMap(hash_map) => EvalResult::Type(Type::HashMap(
+                hash_map
+                    .into_iter()
+                    .map(|(key, value)| {
+                        eval(value, environment)
+                            .map(|value| (key, value.as_type().unwrap().clone()))
+                    })
+                    .try_collect()?,
+            )),
+            _ => EvalResult::Type(ast.clone()),
+        })
+    }
+    eval(ast, environment)
 }
 
 fn print(input: &Type) -> String {
