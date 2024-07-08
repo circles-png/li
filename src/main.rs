@@ -3,7 +3,10 @@ use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use rustyline::{error::ReadlineError, DefaultEditor};
-use std::fmt::{self, Display, Formatter};
+use std::{
+    collections::HashMap,
+    fmt::{self, Display, Formatter},
+};
 use thiserror::Error;
 
 fn main() {
@@ -14,7 +17,7 @@ fn main() {
     eprintln!(
         "{} {} {}{}",
         "starting".dimmed(),
-        env!("CARGO_PKG_NAME").truecolor(255, 136, 0),
+        env!("CARGO_PKG_NAME").green(),
         env!("CARGO_PKG_VERSION").dimmed(),
         "...".dimmed()
     );
@@ -47,6 +50,7 @@ fn main() {
                 continue;
             }
         };
+
         match rep(&tokens) {
             Ok(output) => {
                 println!("{output}");
@@ -58,9 +62,100 @@ fn main() {
     }
 }
 
-#[allow(clippy::missing_const_for_fn)]
-fn eval(input: Type) -> Type {
-    input
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvalResult<F>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    Function(F),
+    List(Vec<EvalResult<F>>),
+    Type(Type),
+}
+
+impl<F> EvalResult<F>
+where
+    F: Fn(f64, f64) -> f64,
+{
+    const fn as_function(&self) -> Option<&F> {
+        if let Self::Function(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    const fn as_type(&self) -> Option<&Type> {
+        if let Self::Type(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    const fn as_list(&self) -> Option<&Vec<Self>> {
+        if let Self::List(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+fn eval_ast<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
+where
+    F: Fn(f64, f64) -> f64 + Clone,
+{
+    Ok(match ast {
+        Type::Symbol(symbol) => EvalResult::Function(
+            environment
+                .get(&symbol.to_string().as_str())
+                .ok_or(Error::BadOperator(symbol.to_string()))?
+                .clone(),
+        ),
+        Type::List(list) => EvalResult::List(
+            list.iter()
+                .map(|item| eval(item.clone(), environment))
+                .try_collect()?,
+        ),
+        Type::Vector(vector) => EvalResult::Type(Type::Vector(
+            vector
+                .into_iter()
+                .map(|item| {
+                    eval(item, environment).map(|result| result.as_type().unwrap().clone())
+                })
+                .try_collect()?,
+        )),
+        Type::HashMap(hash_map) => EvalResult::Type(Type::HashMap(
+            hash_map
+                .into_iter()
+                .map(|(key, value)| {
+                    eval(value, environment)
+                        .map(|value| (key, value.as_type().unwrap().clone()))
+                })
+                .try_collect()?,
+        )),
+        _ => EvalResult::Type(ast.clone()),
+    })
+}
+fn eval<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
+where
+    F: Fn(f64, f64) -> f64 + Clone,
+{
+    Ok(match ast {
+        Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
+        Type::List(_) => {
+            let result = eval_ast(ast, environment)?;
+            let list = result.as_list().unwrap();
+            EvalResult::Type(Type::Number(
+                list.iter()
+                    .skip(1)
+                    .map(|item| *item.as_type().unwrap().as_number().unwrap())
+                    .reduce(list.first().unwrap().as_function().unwrap())
+                    .unwrap(),
+            ))
+        }
+        _ => eval_ast(ast, environment)?,
+    })
 }
 
 fn print(input: &Type) -> String {
@@ -68,7 +163,18 @@ fn print(input: &Type) -> String {
 }
 
 fn rep(input: &[Token]) -> Result<String, Error> {
-    Ok(print(&eval(Type::from_tokens(input)?.0)))
+    let mut environment = HashMap::new();
+    environment.extend([
+        ("+", &(|a: f64, b: f64| a + b)),
+        ("-", &(|a: f64, b: f64| a - b)),
+        ("*", &(|a: f64, b: f64| a * b)),
+        ("/", &(|a: f64, b: f64| a / b)),
+    ] as [(&str, &dyn Fn(f64, f64) -> f64); 4]);
+    Ok(print(
+        eval(Type::from_tokens(input)?.0, &environment)?
+            .as_type()
+            .unwrap(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,12 +406,14 @@ enum Error {
     UnexpectedEof,
     #[error("string unbalanced (missing closing `\"`)")]
     UnbalancedString,
-    #[error(r#"bad escape (expected one of '\n', '\\', '\"', got {0})"#)]
+    #[error(r#"bad escape (found {0}, expected one of '\n', '\\', '\"')"#)]
     BadEscape(String),
-    #[error("missing value in hash-map (found key {0}, but no value)")]
+    #[error("missing value in hash-map (found key {0}, expected a value after it)")]
     MissingHashMapValue(HashMapKey),
     #[error("bad key in hash-map (found {0}, expected a keyword or string)")]
     BadHashMapKey(Type),
+    #[error("bad operator at start of list (found {0})")]
+    BadOperator(String),
 }
 
 impl Display for Type {
@@ -448,5 +556,13 @@ impl Type {
                 1,
             ),
         })
+    }
+
+    const fn as_number(&self) -> Option<&f64> {
+        if let Self::Number(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
 }
