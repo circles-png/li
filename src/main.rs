@@ -2,81 +2,163 @@ use colored::Colorize;
 use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use rustyline::{error::ReadlineError, DefaultEditor};
+use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::{
     collections::HashMap,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
+    rc::Rc,
+    string::String,
 };
 use thiserror::Error;
 
-fn main() {
-    setup_panic!(Metadata::new(
-        env!("CARGO_PKG_NAME"),
-        env!("CARGO_PKG_VERSION")
-    ));
-    eprintln!(
-        "{} {} {}{}",
-        "starting".dimmed(),
-        env!("CARGO_PKG_NAME").green(),
-        env!("CARGO_PKG_VERSION").dimmed(),
-        "...".dimmed()
-    );
-    let mut readline = DefaultEditor::new().unwrap();
-    loop {
-        let line = {
-            match readline.readline(&concat!(env!("CARGO_PKG_NAME"), " > ").green().to_string()) {
-                Ok(line) => {
-                    readline.add_history_entry(line.as_str()).unwrap();
-                    line
-                }
-                Err(ReadlineError::Interrupted) => {
-                    eprintln!("interrupted (probably by ctrl-c). bye!");
-                    break;
-                }
-                Err(ReadlineError::Eof) => {
-                    eprintln!("read EOF (probably by ctrl-d). bye!");
-                    break;
-                }
-                Err(err) => {
-                    eprintln!("unexpected error while reading\n\n{err:?}\n\nbye!");
-                    break;
-                }
-            }
-        };
-        let tokens = match Token::tokenise(&line) {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                eprintln!("{}", format!("{error}").red());
-                continue;
-            }
-        };
+#[derive(Clone)]
+struct Environment {
+    outer: Option<Box<Self>>,
+    data: HashMap<Token, EnvironmentValue>,
+}
 
-        match rep(&tokens) {
-            Ok(output) => {
-                println!("{output}");
-            }
-            Err(error) => {
-                eprintln!("{}", format!("{error}").red());
+#[derive(Clone)]
+enum EnvironmentValue {
+    Type(Type),
+    Function(Rc<dyn Fn(f64, f64) -> f64>),
+}
+
+impl Environment {
+    fn new() -> Self {
+        Self {
+            outer: None,
+            data: HashMap::new(),
+        }
+    }
+
+    fn set(&mut self, symbol: Token, value: EnvironmentValue) -> Option<EnvironmentValue> {
+        self.data.insert(symbol, value)
+    }
+
+    fn find(&self, symbol: &Token) -> Option<Self> {
+        if self.data.contains_key(symbol) {
+            return Some(self.clone());
+        } else if let Some(outer) = &self.outer {
+            return outer.find(symbol);
+        }
+        None
+    }
+
+    fn get(&self, symbol: &Token) -> Option<EnvironmentValue> {
+        self.find(symbol)?.data.get(symbol).cloned()
+    }
+}
+
+struct Repl {
+    readline: Editor<(), FileHistory>,
+    environment: Environment,
+}
+
+impl Repl {
+    fn new() -> Self {
+        setup_panic!(Metadata::new(
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        ));
+        eprintln!(
+            "{} {} {}{}",
+            "starting".dimmed(),
+            env!("CARGO_PKG_NAME").green(),
+            env!("CARGO_PKG_VERSION").dimmed(),
+            "...".dimmed()
+        );
+        let readline = DefaultEditor::new().unwrap();
+        let mut environment = Environment::new();
+        environment.set(
+            Token::Other("+".to_string()),
+            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a + b)),
+        );
+        environment.set(
+            Token::Other("-".to_string()),
+            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a - b)),
+        );
+        environment.set(
+            Token::Other("*".to_string()),
+            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a * b)),
+        );
+        environment.set(
+            Token::Other("/".to_string()),
+            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a / b)),
+        );
+        Self {
+            readline,
+            environment,
+        }
+    }
+
+    fn run(&mut self) {
+        loop {
+            let line = {
+                match self
+                    .readline
+                    .readline(&concat!(env!("CARGO_PKG_NAME"), " > ").green().to_string())
+                {
+                    Ok(line) => {
+                        self.readline.add_history_entry(line.as_str()).unwrap();
+                        line
+                    }
+                    Err(ReadlineError::Interrupted) => {
+                        eprintln!("interrupted (probably by ctrl-c). bye!");
+                        break;
+                    }
+                    Err(ReadlineError::Eof) => {
+                        eprintln!("read EOF (probably by ctrl-d). bye!");
+                        break;
+                    }
+                    Err(err) => {
+                        eprintln!("unexpected error while reading\n\n{err:?}\n\nbye!");
+                        break;
+                    }
+                }
+            };
+            let tokens = match Token::tokenise(&line) {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    eprintln!("{}", format!("{error}").red());
+                    continue;
+                }
+            };
+
+            match rep(&tokens, &mut self.environment) {
+                Ok(output) => {
+                    println!("{output}");
+                }
+                Err(error) => {
+                    eprintln!("{}", format!("{error}").red());
+                }
             }
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EvalResult<F>
-where
-    F: Fn(f64, f64) -> f64,
-{
-    Function(F),
-    List(Vec<EvalResult<F>>),
+fn main() {
+    Repl::new().run();
+}
+
+#[derive(Clone)]
+enum EvalResult {
+    Function(Rc<dyn Fn(f64, f64) -> f64>),
+    ResultList(Vec<EvalResult>),
     Type(Type),
 }
 
-impl<F> EvalResult<F>
-where
-    F: Fn(f64, f64) -> f64,
-{
-    const fn as_function(&self) -> Option<&F> {
+impl Debug for EvalResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Function(_) => write!(f, "[function]"),
+            Self::ResultList(list) => Debug::fmt(list, f),
+            Self::Type(value) => Debug::fmt(value, f),
+        }
+    }
+}
+
+impl EvalResult {
+    const fn as_function(&self) -> Option<&Rc<dyn Fn(f64, f64) -> f64>> {
         if let Self::Function(v) = self {
             Some(v)
         } else {
@@ -92,8 +174,8 @@ where
         }
     }
 
-    const fn as_list(&self) -> Option<&Vec<Self>> {
-        if let Self::List(v) = self {
+    const fn as_result_list(&self) -> Option<&Vec<Self>> {
+        if let Self::ResultList(v) = self {
             Some(v)
         } else {
             None
@@ -101,42 +183,86 @@ where
     }
 }
 
-fn eval<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
-where
-    F: Fn(f64, f64) -> f64 + Clone,
-{
-    fn eval<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
-    where
-        F: Fn(f64, f64) -> f64 + Clone,
-    {
+#[allow(clippy::too_many_lines)]
+fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
+    fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
         Ok(match ast {
             Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
             Type::List(_) => {
-                let result = eval_ast(ast, environment)?;
-                let list = result.as_list().unwrap();
-                EvalResult::Type(Type::Number(
-                    list.iter()
-                        .skip(1)
-                        .map(|item| *item.as_type().unwrap().as_number().unwrap())
-                        .reduce(list.first().unwrap().as_function().unwrap())
-                        .unwrap(),
-                ))
+                let unevaluated = ast.as_list().unwrap();
+                match unevaluated
+                    .first()
+                    .unwrap()
+                    .as_symbol()
+                    .and_then(Token::as_other)
+                    .map(String::as_str)
+                {
+                    Some("def!") => {
+                        let result = eval(unevaluated.get(2).unwrap().clone(), environment)?;
+                        environment.set(
+                            unevaluated.get(1).unwrap().as_symbol().unwrap().clone(),
+                            EnvironmentValue::Type(result.as_type().unwrap().clone()),
+                        );
+                        result
+                    }
+                    Some("let*") => {
+                        let mut new = Environment::new();
+                        new.outer = Some(Box::new(environment.clone()));
+                        let pairs = match unevaluated.get(1).unwrap() {
+                            Type::List(list) => list,
+                            Type::Vector(vector) => vector,
+                            _ => todo!("error"),
+                        }
+                        .chunks_exact(2);
+                        if !pairs.remainder().is_empty() {
+                            todo!("this should be an error!!")
+                        }
+                        for pair in pairs {
+                            match pair {
+                                [name, value] => {
+                                    let value = EnvironmentValue::Type(
+                                        eval(value.clone(), &mut new)?.as_type().unwrap().clone(),
+                                    );
+                                    new.set(name.as_symbol().unwrap().clone(), value);
+                                }
+                                _ => todo!("error"),
+                            }
+                        }
+
+                        eval(unevaluated.get(2).unwrap().clone(), &mut new)?
+                    }
+                    _ => {
+                        let result = eval_ast(ast.clone(), environment)?;
+                        let evaluated = result.as_result_list().unwrap();
+                        EvalResult::Type(Type::Number(
+                            evaluated
+                                .iter()
+                                .skip(1)
+                                .map(|item| *item.as_type().unwrap().as_number().unwrap())
+                                .reduce(|a, b| {
+                                    let function = Rc::clone(
+                                        evaluated.first().unwrap().as_function().unwrap(),
+                                    );
+                                    function(a, b)
+                                })
+                                .unwrap(),
+                        ))
+                    }
+                }
             }
             _ => eval_ast(ast, environment)?,
         })
     }
-    fn eval_ast<F>(ast: Type, environment: &HashMap<&str, F>) -> Result<EvalResult<F>, Error>
-    where
-        F: Fn(f64, f64) -> f64 + Clone,
-    {
+    fn eval_ast(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
         Ok(match ast {
-            Type::Symbol(symbol) => EvalResult::Function(
-                environment
-                    .get(&symbol.to_string().as_str())
-                    .ok_or(Error::BadOperator(symbol.to_string()))?
-                    .clone(),
-            ),
-            Type::List(list) => EvalResult::List(
+            Type::Symbol(symbol) => match environment
+                .get(&symbol)
+                .ok_or(Error::NotFound(symbol.to_string()))?
+            {
+                EnvironmentValue::Function(function) => EvalResult::Function(Rc::clone(&function)),
+                EnvironmentValue::Type(value) => EvalResult::Type(value),
+            },
+            Type::List(list) => EvalResult::ResultList(
                 list.iter()
                     .map(|item| eval(item.clone(), environment))
                     .try_collect()?,
@@ -168,28 +294,18 @@ fn print(input: &Type) -> String {
     input.to_string()
 }
 
-fn rep(input: &[Token]) -> Result<String, Error> {
-    let mut environment = HashMap::new();
-    environment.extend([
-        ("+", &(|a: f64, b: f64| a + b)),
-        ("-", &(|a: f64, b: f64| a - b)),
-        ("*", &(|a: f64, b: f64| a * b)),
-        ("/", &(|a: f64, b: f64| a / b)),
-    ] as [(&str, &dyn Fn(f64, f64) -> f64); 4]);
-    Ok(print(
-        eval(Type::from_tokens(input)?.0, &environment)?
-            .as_type()
-            .unwrap(),
-    ))
+fn rep(input: &[Token], environment: &mut Environment) -> Result<String, Error> {
+    let result = eval(Type::from_tokens(input)?.0, environment)?;
+    Ok(print(result.as_type().unwrap()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Balancing {
     Balanced,
     Unbalanced,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Token {
     TildeAt,
     LeftSquare,
@@ -204,7 +320,7 @@ enum Token {
     Caret,
     At,
     String(String, Balancing),
-    Normal(String),
+    Other(String),
 }
 
 impl Token {
@@ -300,7 +416,7 @@ impl Token {
             loop {
                 let next = {
                     let Some((char, rest)) = input.split_at_checked(1) else {
-                        tokens.push(Self::Normal(token));
+                        tokens.push(Self::Other(token));
                         break 'outer;
                     };
                     input = rest;
@@ -312,7 +428,7 @@ impl Token {
                         '[' | ']' | '{' | '}' | '(' | '\'' | '"' | '`' | ',' | ';' | ')'
                     )
                 {
-                    tokens.push(Self::Normal(token));
+                    tokens.push(Self::Other(token));
                     tokens.extend(Self::tokenise(&next.to_string())?);
                     continue 'outer;
                 }
@@ -320,6 +436,14 @@ impl Token {
             }
         }
         Ok(tokens)
+    }
+
+    const fn as_other(&self) -> Option<&String> {
+        if let Self::Other(v) = self {
+            Some(v)
+        } else {
+            None
+        }
     }
 }
 
@@ -350,7 +474,7 @@ impl Display for Token {
                         Self::Tilde => "~",
                         Self::Caret => "^",
                         Self::At => "@",
-                        Self::Normal(string) => string,
+                        Self::Other(string) => string,
                         Self::String(_, _) => unreachable!(),
                     }
                     .to_string()
@@ -418,8 +542,8 @@ enum Error {
     MissingHashMapValue(HashMapKey),
     #[error("bad key in hash-map (found {0}, expected a keyword or string)")]
     BadHashMapKey(Type),
-    #[error("bad operator at start of list (found {0})")]
-    BadOperator(String),
+    #[error("symbol at start of list not found (found {0})")]
+    NotFound(String),
 }
 
 impl Display for Type {
@@ -524,7 +648,7 @@ impl Type {
                 let (parameter, len) = Self::from_tokens(&input[1..])?;
                 (
                     Self::List(vec![
-                        Self::Symbol(Token::Normal(
+                        Self::Symbol(Token::Other(
                             match first {
                                 Token::SingleQuote => "quote",
                                 Token::Backtick => "quasiquote",
@@ -545,7 +669,7 @@ impl Type {
                         Balancing::Balanced => Ok(Self::String(string.clone())),
                         Balancing::Unbalanced => Err(Error::UnbalancedString),
                     },
-                    Token::Normal(string) => Ok(string.parse::<f64>().map_or(
+                    Token::Other(string) => Ok(string.parse::<f64>().map_or(
                         match string.as_str() {
                             "nil" => Self::Nil,
                             "true" => Self::True,
@@ -553,7 +677,7 @@ impl Type {
                             string if string.starts_with(':') => {
                                 Self::Keyword(string[1..].to_string())
                             }
-                            _ => Self::Symbol(Token::Normal(string.clone())),
+                            _ => Self::Symbol(Token::Other(string.clone())),
                         },
                         Self::Number,
                     )),
@@ -566,6 +690,22 @@ impl Type {
 
     const fn as_number(&self) -> Option<&f64> {
         if let Self::Number(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    const fn as_symbol(&self) -> Option<&Token> {
+        if let Self::Symbol(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    const fn as_list(&self) -> Option<&Vec<Type>> {
+        if let Self::List(v) = self {
             Some(v)
         } else {
             None
