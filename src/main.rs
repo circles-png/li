@@ -4,23 +4,14 @@ use indexmap::IndexMap;
 use itertools::Itertools;
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::{
-    collections::HashMap,
-    fmt::{self, Debug, Display, Formatter},
-    rc::Rc,
-    string::String,
+    collections::HashMap, env, fmt::{self, Debug, Display, Formatter}, rc::Rc, string::String
 };
 use thiserror::Error;
 
 #[derive(Clone)]
 struct Environment {
     outer: Option<Box<Self>>,
-    data: HashMap<Token, EnvironmentValue>,
-}
-
-#[derive(Clone)]
-enum EnvironmentValue {
-    Type(Type),
-    Function(Rc<dyn Fn(f64, f64) -> f64>),
+    data: HashMap<Token, Type>,
 }
 
 impl Environment {
@@ -31,7 +22,7 @@ impl Environment {
         }
     }
 
-    fn set(&mut self, symbol: Token, value: EnvironmentValue) -> Option<EnvironmentValue> {
+    fn set(&mut self, symbol: Token, value: Type) -> Option<Type> {
         self.data.insert(symbol, value)
     }
 
@@ -44,7 +35,7 @@ impl Environment {
         None
     }
 
-    fn get(&self, symbol: &Token) -> Option<EnvironmentValue> {
+    fn get(&self, symbol: &Token) -> Option<Type> {
         self.find(symbol)?.data.get(symbol).cloned()
     }
 }
@@ -69,22 +60,26 @@ impl Repl {
         );
         let readline = DefaultEditor::new().unwrap();
         let mut environment = Environment::new();
-        environment.set(
-            Token::Other("+".to_string()),
-            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a + b)),
-        );
-        environment.set(
-            Token::Other("-".to_string()),
-            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a - b)),
-        );
-        environment.set(
-            Token::Other("*".to_string()),
-            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a * b)),
-        );
-        environment.set(
-            Token::Other("/".to_string()),
-            EnvironmentValue::Function(Rc::new(|a: f64, b: f64| a / b)),
-        );
+        for (symbol, op) in [
+            ("+", &|a, b| a + b),
+            ("-", &|a, b| a - b),
+            ("*", &|a, b| a * b),
+            ("/", &|a, b| a / b),
+        ] as [(&str, &dyn Fn(f64, f64) -> f64); 4]
+        {
+            environment.set(
+                Token::Other(symbol.to_string()),
+                Type::Function(Rc::new(move |values| {
+                    Type::Number(
+                        values
+                            .iter()
+                            .map(|value| *value.as_number().unwrap())
+                            .reduce(op)
+                            .unwrap(),
+                    )
+                })),
+            );
+        }
         Self {
             readline,
             environment,
@@ -142,7 +137,6 @@ fn main() {
 
 #[derive(Clone)]
 enum EvalResult {
-    Function(Rc<dyn Fn(f64, f64) -> f64>),
     ResultList(Vec<EvalResult>),
     Type(Type),
 }
@@ -150,7 +144,6 @@ enum EvalResult {
 impl Debug for EvalResult {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Function(_) => write!(f, "[function]"),
             Self::ResultList(list) => Debug::fmt(list, f),
             Self::Type(value) => Debug::fmt(value, f),
         }
@@ -158,14 +151,6 @@ impl Debug for EvalResult {
 }
 
 impl EvalResult {
-    const fn as_function(&self) -> Option<&Rc<dyn Fn(f64, f64) -> f64>> {
-        if let Self::Function(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
     const fn as_type(&self) -> Option<&Type> {
         if let Self::Type(v) = self {
             Some(v)
@@ -201,7 +186,7 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                         let result = eval(unevaluated.get(2).unwrap().clone(), environment)?;
                         environment.set(
                             unevaluated.get(1).unwrap().as_symbol().unwrap().clone(),
-                            EnvironmentValue::Type(result.as_type().unwrap().clone()),
+                            result.as_type().unwrap().clone(),
                         );
                         result
                     }
@@ -220,9 +205,8 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                         for pair in pairs {
                             match pair {
                                 [name, value] => {
-                                    let value = EnvironmentValue::Type(
-                                        eval(value.clone(), &mut new)?.as_type().unwrap().clone(),
-                                    );
+                                    let value =
+                                        eval(value.clone(), &mut new)?.as_type().unwrap().clone();
                                     new.set(name.as_symbol().unwrap().clone(), value);
                                 }
                                 _ => todo!("error"),
@@ -231,21 +215,63 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
 
                         eval(unevaluated.get(2).unwrap().clone(), &mut new)?
                     }
+                    Some("do") => eval_ast(Type::List(unevaluated[1..].to_vec()), environment)?,
+                    Some("if") => {
+                        if match eval(unevaluated.get(1).unwrap().clone(), environment)? {
+                            EvalResult::Type(Type::Nil | Type::False) => false,
+                            EvalResult::Type(_) => true,
+                            EvalResult::ResultList(_) => todo!(),
+                        } {
+                            eval(unevaluated.get(2).unwrap().clone(), environment)?
+                        } else {
+                            let get = unevaluated.get(3);
+                            match get {
+                                Some(get) => eval(get.clone(), environment)?,
+                                None => EvalResult::Type(Type::Nil),
+                            }
+                        }
+                    }
+                    Some("fn*") => {
+                        let environment = environment.clone();
+                        let unevaluated = unevaluated.clone();
+                        EvalResult::Type(Type::Function(Rc::new(move |values| {
+                            let mut new = Environment::new();
+                            new.outer = Some(Box::new(environment.clone()));
+                            for (bind, expr) in unevaluated
+                                .get(1)
+                                .unwrap()
+                                .as_list()
+                                .unwrap()
+                                .iter()
+                                .map(|value| value.as_symbol().unwrap().clone())
+                                .zip_eq(values)
+                            {
+                                new.set(bind, expr.clone());
+                            }
+                            eval(unevaluated.get(2).unwrap().clone(), &mut new)
+                                .unwrap()
+                                .as_type()
+                                .unwrap()
+                                .clone()
+                        })))
+                    }
                     _ => {
                         let result = eval_ast(ast.clone(), environment)?;
                         let evaluated = result.as_result_list().unwrap();
-                        EvalResult::Type(Type::Number(
+                        EvalResult::Type(Rc::clone(
                             evaluated
+                                .first()
+                                .unwrap()
+                                .as_type()
+                                .unwrap()
+                                .as_function()
+                                .unwrap(),
+                        )(
+                            &evaluated
                                 .iter()
                                 .skip(1)
-                                .map(|item| *item.as_type().unwrap().as_number().unwrap())
-                                .reduce(|a, b| {
-                                    let function = Rc::clone(
-                                        evaluated.first().unwrap().as_function().unwrap(),
-                                    );
-                                    function(a, b)
-                                })
-                                .unwrap(),
+                                .map(|item| item.as_type().unwrap().clone())
+                                .collect_vec(),
                         ))
                     }
                 }
@@ -255,13 +281,11 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
     }
     fn eval_ast(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
         Ok(match ast {
-            Type::Symbol(symbol) => match environment
-                .get(&symbol)
-                .ok_or(Error::NotFound(symbol.to_string()))?
-            {
-                EnvironmentValue::Function(function) => EvalResult::Function(Rc::clone(&function)),
-                EnvironmentValue::Type(value) => EvalResult::Type(value),
-            },
+            Type::Symbol(symbol) => EvalResult::Type(
+                environment
+                    .get(&symbol)
+                    .ok_or(Error::NotFound(symbol.to_string()))?,
+            ),
             Type::List(list) => EvalResult::ResultList(
                 list.iter()
                     .map(|item| eval(item.clone(), environment))
@@ -514,7 +538,7 @@ impl TryFrom<Type> for HashMapKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone)]
 enum Type {
     List(Vec<Type>),
     Vector(Vec<Type>),
@@ -526,9 +550,17 @@ enum Type {
     True,
     False,
     Keyword(String),
+    Function(Function),
 }
 
-impl Eq for Type {}
+impl Debug for Type {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Function(_) => writeln!(f, "#<function>"),
+            other => Debug::fmt(other, f),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 enum Error {
@@ -581,6 +613,7 @@ impl Display for Type {
                         .join(" ")
                 ),
                 Self::Keyword(string) => format!(":{string}"),
+                Self::Function(_) => "#<function>".to_string(),
             }
         })
     }
@@ -704,11 +737,21 @@ impl Type {
         }
     }
 
-    const fn as_list(&self) -> Option<&Vec<Type>> {
+    const fn as_list(&self) -> Option<&Vec<Self>> {
         if let Self::List(v) = self {
             Some(v)
         } else {
             None
         }
     }
+
+    fn as_function(&self) -> Option<&Function> {
+        if let Self::Function(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
 }
+
+type Function = Rc<dyn Fn(&[Type]) -> Type>;
