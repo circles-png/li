@@ -1,16 +1,21 @@
 use colored::Colorize;
+use core::mem::discriminant;
 use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::{
-    collections::HashMap, env, fmt::{self, Debug, Display, Formatter}, rc::Rc, string::String
+    cell::RefCell,
+    collections::HashMap,
+    env,
+    fmt::{self, Debug, Display, Formatter},
+    ops::Deref,
+    rc::Rc,
 };
 use thiserror::Error;
 
-#[derive(Clone)]
 struct Environment {
-    outer: Option<Box<Self>>,
+    outer: Option<Rc<RefCell<Self>>>,
     data: HashMap<Token, Type>,
 }
 
@@ -22,15 +27,18 @@ impl Environment {
         }
     }
 
-    fn set(&mut self, symbol: Token, value: Type) -> Option<Type> {
-        self.data.insert(symbol, value)
+    fn set(&mut self, symbol: Token, value: Type) {
+        self.data.insert(symbol, value);
     }
 
     fn find(&self, symbol: &Token) -> Option<Self> {
         if self.data.contains_key(symbol) {
-            return Some(self.clone());
+            return Some(Self {
+                outer: self.outer.as_ref().map(Rc::clone),
+                data: self.data.clone(),
+            });
         } else if let Some(outer) = &self.outer {
-            return outer.find(symbol);
+            return outer.borrow().find(symbol);
         }
         None
     }
@@ -42,7 +50,7 @@ impl Environment {
 
 struct Repl {
     readline: Editor<(), FileHistory>,
-    environment: Environment,
+    environment: Rc<RefCell<Environment>>,
 }
 
 impl Repl {
@@ -80,13 +88,63 @@ impl Repl {
                 })),
             );
         }
+        for (symbol, function) in [
+            ("prn", &|values| {
+                println!("{}", values.first().unwrap().display());
+                Type::Nil
+            }),
+            ("list", &|values| Type::List(values.to_vec())),
+            ("list?", &|values| {
+                Type::Bool(values.first().unwrap().as_list().is_some())
+            }),
+            ("empty?", &|values| {
+                Type::Bool(values.first().unwrap().as_list().unwrap().is_empty())
+            }),
+            ("count", &|values| {
+                #[allow(clippy::cast_precision_loss)]
+                Type::Number(
+                    (match values.first().unwrap() {
+                        Type::List(list) => list.len(),
+                        Type::Nil => 0,
+                        _ => unimplemented!(),
+                    }) as f64,
+                )
+            }),
+            ("=", &|values| {
+                Type::Bool(values.first().unwrap() == values.get(1).unwrap())
+            }),
+        ] as [(&str, &<Function as Deref>::Target); 6]
+        {
+            environment.set(
+                Token::Other(symbol.to_string()),
+                Type::Function(Rc::new(function)),
+            );
+        }
+        for (symbol, op) in [
+            ("<", &|a, b| a < b),
+            ("<=", &|a, b| a <= b),
+            (">", &|a, b| a > b),
+            (">=", &|a, b| a >= b),
+        ] as [(&str, &dyn Fn(f64, f64) -> bool); 4]
+        {
+            environment.set(
+                Token::Other(symbol.to_string()),
+                Type::Function(Rc::new(|values| {
+                    Type::Bool(op(
+                        *values.first().unwrap().as_number().unwrap(),
+                        *values.get(1).unwrap().as_number().unwrap(),
+                    ))
+                })),
+            );
+        }
+        let environment = Rc::new(RefCell::new(environment));
         Self {
             readline,
             environment,
         }
     }
 
-    fn run(&mut self) {
+    fn run(mut self) {
         loop {
             let line = {
                 match self
@@ -119,7 +177,7 @@ impl Repl {
                 }
             };
 
-            match rep(&tokens, &mut self.environment) {
+            match rep(&tokens, Rc::clone(&self.environment)) {
                 Ok(output) => {
                     println!("{output}");
                 }
@@ -135,19 +193,10 @@ fn main() {
     Repl::new().run();
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum EvalResult {
     ResultList(Vec<EvalResult>),
     Type(Type),
-}
-
-impl Debug for EvalResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ResultList(list) => Debug::fmt(list, f),
-            Self::Type(value) => Debug::fmt(value, f),
-        }
-    }
 }
 
 impl EvalResult {
@@ -169,8 +218,8 @@ impl EvalResult {
 }
 
 #[allow(clippy::too_many_lines)]
-fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
-    fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
+fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
+    fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
         Ok(match ast {
             Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
             Type::List(_) => {
@@ -183,8 +232,9 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                     .map(String::as_str)
                 {
                     Some("def!") => {
-                        let result = eval(unevaluated.get(2).unwrap().clone(), environment)?;
-                        environment.set(
+                        let result =
+                            eval(unevaluated.get(2).unwrap().clone(), Rc::clone(&environment))?;
+                        environment.borrow_mut().set(
                             unevaluated.get(1).unwrap().as_symbol().unwrap().clone(),
                             result.as_type().unwrap().clone(),
                         );
@@ -192,7 +242,8 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                     }
                     Some("let*") => {
                         let mut new = Environment::new();
-                        new.outer = Some(Box::new(environment.clone()));
+                        new.outer = Some(Rc::clone(&environment));
+                        let new = Rc::new(RefCell::new(new));
                         let pairs = match unevaluated.get(1).unwrap() {
                             Type::List(list) => list,
                             Type::Vector(vector) => vector,
@@ -205,22 +256,31 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                         for pair in pairs {
                             match pair {
                                 [name, value] => {
-                                    let value =
-                                        eval(value.clone(), &mut new)?.as_type().unwrap().clone();
-                                    new.set(name.as_symbol().unwrap().clone(), value);
+                                    let value = eval(value.clone(), Rc::clone(&new))?
+                                        .as_type()
+                                        .unwrap()
+                                        .clone();
+                                    new.borrow_mut()
+                                        .set(name.as_symbol().unwrap().clone(), value);
                                 }
                                 _ => todo!("error"),
                             }
                         }
 
-                        eval(unevaluated.get(2).unwrap().clone(), &mut new)?
+                        eval(unevaluated.get(2).unwrap().clone(), new)?
                     }
-                    Some("do") => eval_ast(Type::List(unevaluated[1..].to_vec()), environment)?,
+                    Some("do") => eval_ast(Type::List(unevaluated[1..].to_vec()), &environment)?
+                        .as_result_list()
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .clone(),
                     Some("if") => {
-                        if match eval(unevaluated.get(1).unwrap().clone(), environment)? {
-                            EvalResult::Type(Type::Nil | Type::False) => false,
+                        if match eval(unevaluated.get(1).unwrap().clone(), Rc::clone(&environment))?
+                        {
+                            EvalResult::Type(Type::Nil | Type::Bool(false)) => false,
                             EvalResult::Type(_) => true,
-                            EvalResult::ResultList(_) => todo!(),
+                            EvalResult::ResultList(_) => unimplemented!(),
                         } {
                             eval(unevaluated.get(2).unwrap().clone(), environment)?
                         } else {
@@ -232,11 +292,11 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                         }
                     }
                     Some("fn*") => {
-                        let environment = environment.clone();
                         let unevaluated = unevaluated.clone();
                         EvalResult::Type(Type::Function(Rc::new(move |values| {
                             let mut new = Environment::new();
-                            new.outer = Some(Box::new(environment.clone()));
+                            new.outer = Some(Rc::clone(&environment));
+                            let new = Rc::new(RefCell::new(new));
                             for (bind, expr) in unevaluated
                                 .get(1)
                                 .unwrap()
@@ -246,9 +306,9 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                                 .map(|value| value.as_symbol().unwrap().clone())
                                 .zip_eq(values)
                             {
-                                new.set(bind, expr.clone());
+                                new.borrow_mut().set(bind, expr.clone());
                             }
-                            eval(unevaluated.get(2).unwrap().clone(), &mut new)
+                            eval(unevaluated.get(2).unwrap().clone(), new)
                                 .unwrap()
                                 .as_type()
                                 .unwrap()
@@ -256,7 +316,7 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                         })))
                     }
                     _ => {
-                        let result = eval_ast(ast.clone(), environment)?;
+                        let result = eval_ast(ast.clone(), &environment)?;
                         let evaluated = result.as_result_list().unwrap();
                         EvalResult::Type(Rc::clone(
                             evaluated
@@ -276,26 +336,28 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                     }
                 }
             }
-            _ => eval_ast(ast, environment)?,
+            _ => eval_ast(ast, &environment)?,
         })
     }
-    fn eval_ast(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
+    fn eval_ast(ast: Type, environment: &Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
         Ok(match ast {
             Type::Symbol(symbol) => EvalResult::Type(
                 environment
+                    .borrow()
                     .get(&symbol)
                     .ok_or(Error::NotFound(symbol.to_string()))?,
             ),
             Type::List(list) => EvalResult::ResultList(
                 list.iter()
-                    .map(|item| eval(item.clone(), environment))
+                    .map(|item| eval(item.clone(), Rc::clone(environment)))
                     .try_collect()?,
             ),
             Type::Vector(vector) => EvalResult::Type(Type::Vector(
                 vector
                     .into_iter()
                     .map(|item| {
-                        eval(item, environment).map(|result| result.as_type().unwrap().clone())
+                        eval(item, Rc::clone(environment))
+                            .map(|result| result.as_type().unwrap().clone())
                     })
                     .try_collect()?,
             )),
@@ -303,7 +365,7 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
                 hash_map
                     .into_iter()
                     .map(|(key, value)| {
-                        eval(value, environment)
+                        eval(value, Rc::clone(environment))
                             .map(|value| (key, value.as_type().unwrap().clone()))
                     })
                     .try_collect()?,
@@ -315,10 +377,10 @@ fn eval(ast: Type, environment: &mut Environment) -> Result<EvalResult, Error> {
 }
 
 fn print(input: &Type) -> String {
-    input.to_string()
+    input.display()
 }
 
-fn rep(input: &[Token], environment: &mut Environment) -> Result<String, Error> {
+fn rep(input: &[Token], environment: Rc<RefCell<Environment>>) -> Result<String, Error> {
     let result = eval(Type::from_tokens(input)?.0, environment)?;
     Ok(print(result.as_type().unwrap()))
 }
@@ -547,8 +609,7 @@ enum Type {
     String(String),
     Number(f64),
     Nil,
-    True,
-    False,
+    Bool(bool),
     Keyword(String),
     Function(Function),
 }
@@ -556,8 +617,31 @@ enum Type {
 impl Debug for Type {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Function(_) => writeln!(f, "#<function>"),
-            other => Debug::fmt(other, f),
+            Self::List(arg0) => f.debug_tuple("List").field(arg0).finish(),
+            Self::Vector(arg0) => f.debug_tuple("Vector").field(arg0).finish(),
+            Self::HashMap(arg0) => f.debug_tuple("HashMap").field(arg0).finish(),
+            Self::Symbol(arg0) => f.debug_tuple("Symbol").field(arg0).finish(),
+            Self::String(arg0) => f.debug_tuple("String").field(arg0).finish(),
+            Self::Number(arg0) => f.debug_tuple("Number").field(arg0).finish(),
+            Self::Nil => write!(f, "Nil"),
+            Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
+            Self::Keyword(arg0) => f.debug_tuple("Keyword").field(arg0).finish(),
+            Self::Function(_) => write!(f, "Function"),
+        }
+    }
+}
+
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Vector(a), Self::Vector(b)) | (Self::List(a), Self::List(b)) => a == b,
+            (Self::HashMap(a), Self::HashMap(b)) => a == b,
+            (Self::Symbol(a), Self::Symbol(b)) => a == b,
+            (Self::String(a), Self::String(b)) | (Self::Keyword(a), Self::Keyword(b)) => a == b,
+            (Self::Number(a), Self::Number(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Function(_), Self::Function(_)) => false,
+            _ => discriminant(self) == discriminant(other),
         }
     }
 }
@@ -572,51 +656,10 @@ enum Error {
     BadEscape(String),
     #[error("missing value in hash-map (found key {0}, expected a value after it)")]
     MissingHashMapValue(HashMapKey),
-    #[error("bad key in hash-map (found {0}, expected a keyword or string)")]
+    #[error("bad key in hash-map (found {}, expected a keyword or string)", .0.debug())]
     BadHashMapKey(Type),
     #[error("symbol at start of list not found (found {0})")]
     NotFound(String),
-}
-
-impl Display for Type {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", {
-            match self {
-                Self::Number(number) => number.to_string(),
-                Self::String(string) => format!("\"{string}\""),
-                Self::Symbol(symbol) => symbol.to_string(),
-                Self::Nil => "nil".to_string(),
-                Self::True => "true".to_string(),
-                Self::False => "false".to_string(),
-                Self::List(items) => format!(
-                    "({})",
-                    items
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect_vec()
-                        .join(" ")
-                ),
-                Self::Vector(items) => format!(
-                    "[{}]",
-                    items
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect_vec()
-                        .join(" ")
-                ),
-                Self::HashMap(items) => format!(
-                    "{{{}}}",
-                    items
-                        .iter()
-                        .flat_map(|(key, value)| [key.to_string(), value.to_string()])
-                        .collect_vec()
-                        .join(" ")
-                ),
-                Self::Keyword(string) => format!(":{string}"),
-                Self::Function(_) => "#<function>".to_string(),
-            }
-        })
-    }
 }
 
 impl Type {
@@ -705,8 +748,8 @@ impl Type {
                     Token::Other(string) => Ok(string.parse::<f64>().map_or(
                         match string.as_str() {
                             "nil" => Self::Nil,
-                            "true" => Self::True,
-                            "false" => Self::False,
+                            "true" => Self::Bool(true),
+                            "false" => Self::Bool(false),
                             string if string.starts_with(':') => {
                                 Self::Keyword(string[1..].to_string())
                             }
@@ -750,6 +793,49 @@ impl Type {
             Some(v)
         } else {
             None
+        }
+    }
+
+    fn print(&self) -> Result<String, String> {
+        Ok(match self {
+            Self::Number(number) => number.to_string(),
+            Self::Symbol(symbol) => symbol.to_string(),
+            Self::Nil => "nil".to_string(),
+            Self::Bool(bool) => bool.to_string(),
+            Self::List(items) => format!(
+                "({})",
+                items.iter().map(Self::debug).collect_vec().join(" ")
+            ),
+            Self::Vector(items) => format!(
+                "[{}]",
+                items.iter().map(Self::debug).collect_vec().join(" ")
+            ),
+            Self::HashMap(items) => format!(
+                "{{{}}}",
+                items
+                    .iter()
+                    .flat_map(|(key, value)| [key.to_string(), value.debug()])
+                    .collect_vec()
+                    .join(" ")
+            ),
+            Self::Keyword(string) => format!(":{string}"),
+            Self::Function(_) => "#<function>".to_string(),
+            Self::String(string) => return Err(string.clone()),
+        })
+    }
+
+    fn debug(&self) -> String {
+        match self.print() {
+            Ok(string) => string,
+            Err(string) => {
+                format!("{string:?}")
+            }
+        }
+    }
+
+    fn display(&self) -> String {
+        match self.print() {
+            Ok(string) | Err(string) => string,
         }
     }
 }
