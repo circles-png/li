@@ -2,15 +2,17 @@ use colored::Colorize;
 use core::mem::discriminant;
 use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
-use itertools::Itertools;
+use itertools::{EitherOrBoth, Itertools};
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::{
     cell::RefCell,
     collections::HashMap,
     env,
     fmt::{self, Debug, Display, Formatter},
+    iter::once,
     ops::Deref,
     rc::Rc,
+    vec,
 };
 use thiserror::Error;
 
@@ -54,6 +56,7 @@ struct Repl {
 }
 
 impl Repl {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         setup_panic!(Metadata::new(
             env!("CARGO_PKG_NAME"),
@@ -90,7 +93,7 @@ impl Repl {
         }
         for (symbol, function) in [
             ("prn", &|values| {
-                println!("{}", values.first().unwrap().display());
+                println!("{}", values.iter().map(Type::display).join(" "));
                 Type::Nil
             }),
             ("list", &|values| Type::List(values.to_vec())),
@@ -98,13 +101,18 @@ impl Repl {
                 Type::Bool(values.first().unwrap().as_list().is_some())
             }),
             ("empty?", &|values| {
-                Type::Bool(values.first().unwrap().as_list().unwrap().is_empty())
+                Type::Bool(match values.first().unwrap() {
+                    Type::List(list) => list.is_empty(),
+                    Type::Vector(vector) => vector.is_empty(),
+                    _ => unimplemented!(),
+                })
             }),
             ("count", &|values| {
                 #[allow(clippy::cast_precision_loss)]
                 Type::Number(
                     (match values.first().unwrap() {
                         Type::List(list) => list.len(),
+                        Type::Vector(vector) => vector.len(),
                         Type::Nil => 0,
                         _ => unimplemented!(),
                     }) as f64,
@@ -113,7 +121,17 @@ impl Repl {
             ("=", &|values| {
                 Type::Bool(values.first().unwrap() == values.get(1).unwrap())
             }),
-        ] as [(&str, &<Function as Deref>::Target); 6]
+            ("pr-str", &|values| {
+                Type::String(values.iter().map(Type::display).join(" "))
+            }),
+            ("str", &|values| {
+                Type::String(values.iter().map(Type::debug).collect())
+            }),
+            ("println", &|values| {
+                println!("{}", values.iter().map(Type::display).join(" "));
+                Type::Nil
+            }),
+        ] as [(&str, &<Function as Deref>::Target); 9]
         {
             environment.set(
                 Token::Other(symbol.to_string()),
@@ -145,6 +163,17 @@ impl Repl {
     }
 
     fn run(mut self) {
+        const RC: &[&str] = &["(def! not (fn* (a) (if a false true)))"];
+        let run = |line: String| match Token::tokenise(&line) {
+            Ok(tokens) => match rep(&tokens, Rc::clone(&self.environment)) {
+                Ok(output) => Ok(output),
+                Err(error) => Err(format!("{error}").red()),
+            },
+            Err(error) => Err(format!("{error}").red()),
+        };
+        for line in RC {
+            run((*line).to_string()).unwrap();
+        }
         loop {
             let line = {
                 match self
@@ -169,22 +198,15 @@ impl Repl {
                     }
                 }
             };
-            let tokens = match Token::tokenise(&line) {
-                Ok(tokens) => tokens,
-                Err(error) => {
-                    eprintln!("{}", format!("{error}").red());
-                    continue;
-                }
-            };
-
-            match rep(&tokens, Rc::clone(&self.environment)) {
+            match run(line) {
                 Ok(output) => {
                     println!("{output}");
                 }
                 Err(error) => {
-                    eprintln!("{}", format!("{error}").red());
+                    eprintln!("{error}");
+                    continue;
                 }
-            }
+            };
         }
     }
 }
@@ -294,19 +316,56 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                     Some("fn*") => {
                         let unevaluated = unevaluated.clone();
                         EvalResult::Type(Type::Function(Rc::new(move |values| {
+                            enum BindRest<'a> {
+                                None,
+                                BindEmpty,
+                                BindFirstValue(&'a Type),
+                            }
                             let mut new = Environment::new();
                             new.outer = Some(Rc::clone(&environment));
                             let new = Rc::new(RefCell::new(new));
-                            for (bind, expr) in unevaluated
-                                .get(1)
-                                .unwrap()
-                                .as_list()
-                                .unwrap()
-                                .iter()
-                                .map(|value| value.as_symbol().unwrap().clone())
-                                .zip_eq(values)
-                            {
-                                new.borrow_mut().set(bind, expr.clone());
+                            let mut bindings = match unevaluated.get(1).unwrap() {
+                                Type::List(list) => list,
+                                Type::Vector(vector) => vector,
+                                _ => unimplemented!(),
+                            }
+                            .iter()
+                            .map(|value| value.as_symbol().unwrap().clone());
+                            let mut binding_rest = BindRest::None;
+                            let mut values = values.iter();
+                            for pair in bindings.by_ref().zip_longest(values.by_ref()) {
+                                match pair {
+                                    EitherOrBoth::Both(binding, value) => {
+                                        if binding == Token::Other("&".to_string()) {
+                                            binding_rest = BindRest::BindFirstValue(value);
+                                            break;
+                                        }
+                                        new.borrow_mut().set(binding, value.clone());
+                                    }
+                                    EitherOrBoth::Left(binding) => {
+                                        if binding == Token::Other("&".to_string()) {
+                                            binding_rest = BindRest::BindEmpty;
+                                            break;
+                                        }
+                                        unimplemented!("error")
+                                    }
+                                    EitherOrBoth::Right(_) => {
+                                        unimplemented!("error")
+                                    }
+                                }
+                            }
+                            match binding_rest {
+                                BindRest::None => {}
+                                BindRest::BindEmpty => {
+                                    let next = bindings.next().unwrap();
+                                    new.borrow_mut().set(next, Type::List(Vec::new()));
+                                }
+                                BindRest::BindFirstValue(first_value) => {
+                                    let next = bindings.next().unwrap();
+                                    let rest =
+                                        values.chain(once(first_value)).cloned().collect_vec();
+                                    new.borrow_mut().set(next, Type::List(rest));
+                                }
                             }
                             eval(unevaluated.get(2).unwrap().clone(), new)
                                 .unwrap()
@@ -634,7 +693,7 @@ impl Debug for Type {
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Vector(a), Self::Vector(b)) | (Self::List(a), Self::List(b)) => a == b,
+            (Self::Vector(a) | Self::List(a), Self::Vector(b) | Self::List(b)) => a == b,
             (Self::HashMap(a), Self::HashMap(b)) => a == b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::String(a), Self::String(b)) | (Self::Keyword(a), Self::Keyword(b)) => a == b,
@@ -796,7 +855,7 @@ impl Type {
         }
     }
 
-    fn print(&self) -> Result<String, String> {
+    fn print(&self, display: bool) -> Result<String, String> {
         Ok(match self {
             Self::Number(number) => number.to_string(),
             Self::Symbol(symbol) => symbol.to_string(),
@@ -804,17 +863,28 @@ impl Type {
             Self::Bool(bool) => bool.to_string(),
             Self::List(items) => format!(
                 "({})",
-                items.iter().map(Self::debug).collect_vec().join(" ")
+                items
+                    .iter()
+                    .map(if display { Self::display } else { Self::debug })
+                    .collect_vec()
+                    .join(" ")
             ),
             Self::Vector(items) => format!(
                 "[{}]",
-                items.iter().map(Self::debug).collect_vec().join(" ")
+                items
+                    .iter()
+                    .map(if display { Self::display } else { Self::debug })
+                    .collect_vec()
+                    .join(" ")
             ),
             Self::HashMap(items) => format!(
                 "{{{}}}",
                 items
                     .iter()
-                    .flat_map(|(key, value)| [key.to_string(), value.debug()])
+                    .flat_map(|(key, value)| [
+                        key.to_string(),
+                        if display { Self::display } else { Self::debug }(value)
+                    ])
                     .collect_vec()
                     .join(" ")
             ),
@@ -825,16 +895,17 @@ impl Type {
     }
 
     fn debug(&self) -> String {
-        match self.print() {
+        match self.print(false) {
             Ok(string) => string,
             Err(string) => {
-                format!("{string:?}")
+                let string = format!("{string:?}");
+                string[1..string.len() - 1].to_string()
             }
         }
     }
 
     fn display(&self) -> String {
-        match self.print() {
+        match self.print(true) {
             Ok(string) | Err(string) => string,
         }
     }
