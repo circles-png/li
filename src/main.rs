@@ -5,14 +5,13 @@ use indexmap::IndexMap;
 use itertools::{EitherOrBoth, Itertools};
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::{
+    backtrace::Backtrace,
     cell::RefCell,
     collections::HashMap,
-    env,
     fmt::{self, Debug, Display, Formatter},
     iter::once,
     ops::Deref,
     rc::Rc,
-    vec,
 };
 use thiserror::Error;
 
@@ -40,7 +39,7 @@ impl Environment {
                 data: self.data.clone(),
             });
         } else if let Some(outer) = &self.outer {
-            return outer.borrow().find(symbol);
+            return outer.deref().borrow().find(symbol);
         }
         None
     }
@@ -69,7 +68,8 @@ impl Repl {
             env!("CARGO_PKG_VERSION").dimmed(),
             "...".dimmed()
         );
-        let readline = DefaultEditor::new().unwrap();
+        let mut readline = DefaultEditor::new().unwrap();
+        let _ = readline.load_history("history");
         let mut environment = Environment::new();
         for (symbol, op) in [
             ("+", &|a, b| a + b),
@@ -80,7 +80,7 @@ impl Repl {
         {
             environment.set(
                 Token::Other(symbol.to_string()),
-                Type::Function(Rc::new(move |values| {
+                Type::Function(FunctionType::Regular(Rc::new(move |values| {
                     Type::Number(
                         values
                             .iter()
@@ -88,7 +88,7 @@ impl Repl {
                             .reduce(op)
                             .unwrap(),
                     )
-                })),
+                }))),
             );
         }
         for (symbol, function) in [
@@ -135,7 +135,7 @@ impl Repl {
         {
             environment.set(
                 Token::Other(symbol.to_string()),
-                Type::Function(Rc::new(function)),
+                Type::Function(FunctionType::Regular(Rc::new(function))),
             );
         }
         for (symbol, op) in [
@@ -147,12 +147,12 @@ impl Repl {
         {
             environment.set(
                 Token::Other(symbol.to_string()),
-                Type::Function(Rc::new(|values| {
+                Type::Function(FunctionType::Regular(Rc::new(|values| {
                     Type::Bool(op(
                         *values.first().unwrap().as_number().unwrap(),
                         *values.get(1).unwrap().as_number().unwrap(),
                     ))
-                })),
+                }))),
             );
         }
         let environment = Rc::new(RefCell::new(environment));
@@ -208,6 +208,7 @@ impl Repl {
                 }
             };
         }
+        self.readline.save_history("history").unwrap();
     }
 }
 
@@ -241,167 +242,282 @@ impl EvalResult {
 
 #[allow(clippy::too_many_lines)]
 fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
-    fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
-        Ok(match ast {
-            Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
-            Type::List(_) => {
-                let unevaluated = ast.as_list().unwrap();
-                match unevaluated
-                    .first()
-                    .unwrap()
-                    .as_symbol()
-                    .and_then(Token::as_other)
-                    .map(String::as_str)
-                {
-                    Some("def!") => {
-                        let result =
-                            eval(unevaluated.get(2).unwrap().clone(), Rc::clone(&environment))?;
-                        environment.borrow_mut().set(
-                            unevaluated.get(1).unwrap().as_symbol().unwrap().clone(),
-                            result.as_type().unwrap().clone(),
-                        );
-                        result
-                    }
-                    Some("let*") => {
-                        let mut new = Environment::new();
-                        new.outer = Some(Rc::clone(&environment));
-                        let new = Rc::new(RefCell::new(new));
-                        let pairs = match unevaluated.get(1).unwrap() {
-                            Type::List(list) => list,
-                            Type::Vector(vector) => vector,
-                            _ => todo!("error"),
-                        }
-                        .chunks_exact(2);
-                        if !pairs.remainder().is_empty() {
-                            todo!("this should be an error!!")
-                        }
-                        for pair in pairs {
-                            match pair {
-                                [name, value] => {
-                                    let value = eval(value.clone(), Rc::clone(&new))?
-                                        .as_type()
-                                        .unwrap()
-                                        .clone();
-                                    new.borrow_mut()
-                                        .set(name.as_symbol().unwrap().clone(), value);
-                                }
-                                _ => todo!("error"),
-                            }
-                        }
-
-                        eval(unevaluated.get(2).unwrap().clone(), new)?
-                    }
-                    Some("do") => eval_ast(Type::List(unevaluated[1..].to_vec()), &environment)?
-                        .as_result_list()
+    fn eval(mut ast: Type, mut environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
+        loop {
+            return Ok(match ast {
+                Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
+                Type::List(_) => {
+                    let unevaluated = ast.as_list().unwrap();
+                    match unevaluated
+                        .first()
                         .unwrap()
-                        .last()
-                        .unwrap()
-                        .clone(),
-                    Some("if") => {
-                        if match eval(unevaluated.get(1).unwrap().clone(), Rc::clone(&environment))?
-                        {
-                            EvalResult::Type(Type::Nil | Type::Bool(false)) => false,
-                            EvalResult::Type(_) => true,
-                            EvalResult::ResultList(_) => unimplemented!(),
-                        } {
-                            eval(unevaluated.get(2).unwrap().clone(), environment)?
-                        } else {
-                            let get = unevaluated.get(3);
-                            match get {
-                                Some(get) => eval(get.clone(), environment)?,
-                                None => EvalResult::Type(Type::Nil),
-                            }
+                        .as_symbol()
+                        .and_then(Token::as_other)
+                        .map(String::as_str)
+                    {
+                        Some("def!") => {
+                            let result =
+                                eval(unevaluated.get(2).unwrap().clone(), Rc::clone(&environment))?;
+                            environment.deref().borrow_mut().set(
+                                unevaluated.get(1).unwrap().as_symbol().unwrap().clone(),
+                                match result {
+                                    EvalResult::Type(ref v) => v.clone(),
+                                    EvalResult::ResultList(_) => unimplemented!(),
+                                },
+                            );
+                            result
                         }
-                    }
-                    Some("fn*") => {
-                        let unevaluated = unevaluated.clone();
-                        EvalResult::Type(Type::Function(Rc::new(move |values| {
-                            enum BindRest<'a> {
-                                None,
-                                BindEmpty,
-                                BindFirstValue(&'a Type),
-                            }
+                        Some("let*") => {
                             let mut new = Environment::new();
                             new.outer = Some(Rc::clone(&environment));
                             let new = Rc::new(RefCell::new(new));
-                            let mut bindings = match unevaluated.get(1).unwrap() {
+                            let pairs = match unevaluated.get(1).unwrap() {
                                 Type::List(list) => list,
                                 Type::Vector(vector) => vector,
-                                _ => unimplemented!(),
+                                _ => todo!("error"),
                             }
-                            .iter()
-                            .map(|value| value.as_symbol().unwrap().clone());
-                            let mut binding_rest = BindRest::None;
-                            let mut values = values.iter();
-                            for pair in bindings.by_ref().zip_longest(values.by_ref()) {
+                            .chunks_exact(2);
+                            if !pairs.remainder().is_empty() {
+                                todo!("this should be an error!!")
+                            }
+                            for pair in pairs {
                                 match pair {
-                                    EitherOrBoth::Both(binding, value) => {
-                                        if binding == Token::Other("&".to_string()) {
-                                            binding_rest = BindRest::BindFirstValue(value);
-                                            break;
+                                    [name, value] => {
+                                        let value = match eval(value.clone(), Rc::clone(&new))? {
+                                            EvalResult::ResultList(_) => unimplemented!(),
+                                            EvalResult::Type(value) => value,
                                         }
-                                        new.borrow_mut().set(binding, value.clone());
+                                        .clone();
+                                        new.deref()
+                                            .borrow_mut()
+                                            .set(name.as_symbol().unwrap().clone(), value);
                                     }
-                                    EitherOrBoth::Left(binding) => {
-                                        if binding == Token::Other("&".to_string()) {
-                                            binding_rest = BindRest::BindEmpty;
-                                            break;
-                                        }
-                                        unimplemented!("error")
-                                    }
-                                    EitherOrBoth::Right(_) => {
-                                        unimplemented!("error")
-                                    }
+                                    _ => todo!("error"),
                                 }
                             }
-                            match binding_rest {
-                                BindRest::None => {}
-                                BindRest::BindEmpty => {
-                                    let next = bindings.next().unwrap();
-                                    new.borrow_mut().set(next, Type::List(Vec::new()));
-                                }
-                                BindRest::BindFirstValue(first_value) => {
-                                    let next = bindings.next().unwrap();
-                                    let rest =
-                                        values.chain(once(first_value)).cloned().collect_vec();
-                                    new.borrow_mut().set(next, Type::List(rest));
-                                }
+                            environment = new;
+                            assert!(
+                                environment
+                                    .borrow()
+                                    .outer
+                                    .as_ref()
+                                    .map_or(true, |outer| { !Rc::ptr_eq(outer, &environment) }),
+                                "????? they are the same ?????\n{}",
+                                Backtrace::force_capture()
+                            );
+                            ast = unevaluated.get(2).unwrap().clone();
+                            continue;
+                        }
+                        Some("do") => {
+                            eval_ast(
+                                Type::List(unevaluated[1..unevaluated.len() - 1].to_vec()),
+                                &environment,
+                            )?
+                            .as_result_list()
+                            .unwrap();
+                            ast = ast.as_list().unwrap().last().unwrap().clone();
+                            continue;
+                        }
+                        Some("if") => {
+                            if match eval(
+                                unevaluated.get(1).unwrap().clone(),
+                                Rc::clone(&environment),
+                            )? {
+                                EvalResult::Type(Type::Nil | Type::Bool(false)) => false,
+                                EvalResult::Type(_) => true,
+                                EvalResult::ResultList(_) => unimplemented!(),
+                            } {
+                                ast = unevaluated.get(2).unwrap().clone();
+                                continue;
                             }
-                            eval(unevaluated.get(2).unwrap().clone(), new)
-                                .unwrap()
-                                .as_type()
-                                .unwrap()
-                                .clone()
-                        })))
-                    }
-                    _ => {
-                        let result = eval_ast(ast.clone(), &environment)?;
-                        let evaluated = result.as_result_list().unwrap();
-                        EvalResult::Type(Rc::clone(
-                            evaluated
-                                .first()
-                                .unwrap()
-                                .as_type()
-                                .unwrap()
-                                .as_function()
-                                .unwrap(),
-                        )(
-                            &evaluated
-                                .iter()
-                                .skip(1)
-                                .map(|item| item.as_type().unwrap().clone())
-                                .collect_vec(),
-                        ))
+                            let get = unevaluated.get(3);
+                            match get {
+                                Some(get) => {
+                                    ast = get.clone();
+                                    continue;
+                                }
+                                None => EvalResult::Type(Type::Nil),
+                            }
+                        }
+                        Some("fn*") => {
+                            let unevaluated = unevaluated.clone();
+                            EvalResult::Type(Type::Function(FunctionType::UserDefined(Box::new(
+                                UserDefined {
+                                    body: ast.as_list().unwrap().get(2).unwrap().clone(),
+                                    params: ast.as_list().unwrap().get(1).unwrap().clone(),
+                                    env: Rc::clone(&environment),
+                                    function: Rc::new(move |values| {
+                                        enum BindRest<'a> {
+                                            None,
+                                            BindEmpty,
+                                            BindFirstValue(&'a Type),
+                                        }
+                                        let mut new = Environment::new();
+                                        new.outer = Some(Rc::clone(&environment));
+                                        let new = Rc::new(RefCell::new(new));
+                                        let mut bindings = match unevaluated.get(1).unwrap() {
+                                            Type::List(list) => list,
+                                            Type::Vector(vector) => vector,
+                                            _ => unimplemented!(),
+                                        }
+                                        .iter()
+                                        .map(|value| value.as_symbol().unwrap().clone());
+                                        let mut binding_rest = BindRest::None;
+                                        let mut values = values.iter();
+                                        for pair in bindings.by_ref().zip_longest(values.by_ref()) {
+                                            match pair {
+                                                EitherOrBoth::Both(binding, value) => {
+                                                    if binding == Token::Other("&".to_string()) {
+                                                        binding_rest =
+                                                            BindRest::BindFirstValue(value);
+                                                        break;
+                                                    }
+                                                    new.deref()
+                                                        .borrow_mut()
+                                                        .set(binding, value.clone());
+                                                }
+                                                EitherOrBoth::Left(binding) => {
+                                                    if binding == Token::Other("&".to_string()) {
+                                                        binding_rest = BindRest::BindEmpty;
+                                                        break;
+                                                    }
+                                                    unimplemented!("error")
+                                                }
+                                                EitherOrBoth::Right(_) => {
+                                                    unimplemented!("error")
+                                                }
+                                            }
+                                        }
+                                        match binding_rest {
+                                            BindRest::None => {}
+                                            BindRest::BindEmpty => {
+                                                let next = bindings.next().unwrap();
+                                                new.deref()
+                                                    .borrow_mut()
+                                                    .set(next, Type::List(Vec::new()));
+                                            }
+                                            BindRest::BindFirstValue(first_value) => {
+                                                let next = bindings.next().unwrap();
+                                                let rest = values
+                                                    .chain(once(first_value))
+                                                    .cloned()
+                                                    .collect_vec();
+                                                new.deref()
+                                                    .borrow_mut()
+                                                    .set(next, Type::List(rest));
+                                            }
+                                        }
+                                        eval(unevaluated.get(2).unwrap().clone(), new)
+                                            .unwrap()
+                                            .as_type()
+                                            .unwrap()
+                                            .clone()
+                                    }),
+                                },
+                            ))))
+                        }
+                        _ => {
+                            let result = eval_ast(ast.clone(), &environment)?;
+                            let evaluated = result.as_result_list().unwrap();
+                            let [function, args @ ..] = evaluated.as_slice() else {
+                                unimplemented!()
+                            };
+                            match function {
+                                EvalResult::Type(Type::Function(FunctionType::Regular(
+                                    function,
+                                ))) => EvalResult::Type(Rc::clone(function)(
+                                    &evaluated
+                                        .iter()
+                                        .skip(1)
+                                        .map(|item| item.as_type().unwrap().clone())
+                                        .collect_vec(),
+                                )),
+                                EvalResult::Type(Type::Function(FunctionType::UserDefined(
+                                    function,
+                                ))) => {
+                                    enum BindRest<'a> {
+                                        None,
+                                        BindEmpty,
+                                        BindFirstValue(&'a Type),
+                                    }
+                                    let UserDefined {
+                                        body,
+                                        params,
+                                        env,
+                                        function: _,
+                                    } = &**function;
+                                    ast = body.clone();
+                                    let mut new = Environment::new();
+                                    new.outer = Some(Rc::clone(env));
+                                    let new = Rc::new(RefCell::new(new));
+                                    let mut bindings = match params {
+                                        Type::List(list) => list,
+                                        Type::Vector(vector) => vector,
+                                        _ => unimplemented!(),
+                                    }
+                                    .iter()
+                                    .map(|value| value.as_symbol().unwrap().clone());
+                                    let mut binding_rest = BindRest::None;
+                                    let mut values =
+                                        args.iter().map(EvalResult::as_type).map(Option::unwrap);
+                                    for pair in bindings.by_ref().zip_longest(values.by_ref()) {
+                                        match pair {
+                                            EitherOrBoth::Both(binding, value) => {
+                                                if binding == Token::Other("&".to_string()) {
+                                                    binding_rest = BindRest::BindFirstValue(value);
+                                                    break;
+                                                }
+                                                new.deref()
+                                                    .borrow_mut()
+                                                    .set(binding, value.clone());
+                                            }
+                                            EitherOrBoth::Left(binding) => {
+                                                if binding == Token::Other("&".to_string()) {
+                                                    binding_rest = BindRest::BindEmpty;
+                                                    break;
+                                                }
+                                                unimplemented!("error")
+                                            }
+                                            EitherOrBoth::Right(_) => {
+                                                unimplemented!("error")
+                                            }
+                                        }
+                                    }
+                                    match binding_rest {
+                                        BindRest::None => {}
+                                        BindRest::BindEmpty => {
+                                            let next = bindings.next().unwrap();
+                                            new.deref()
+                                                .borrow_mut()
+                                                .set(next, Type::List(Vec::new()));
+                                        }
+                                        BindRest::BindFirstValue(first_value) => {
+                                            let next = bindings.next().unwrap();
+                                            let rest = values
+                                                .chain(once(first_value))
+                                                .cloned()
+                                                .collect_vec();
+                                            new.deref().borrow_mut().set(next, Type::List(rest));
+                                        }
+                                    }
+                                    environment = new;
+                                    continue;
+                                }
+                                EvalResult::Type(_) => unimplemented!(),
+                                EvalResult::ResultList(_) => unimplemented!(),
+                            }
+                        }
                     }
                 }
-            }
-            _ => eval_ast(ast, &environment)?,
-        })
+                _ => eval_ast(ast, &environment)?,
+            });
+        }
     }
     fn eval_ast(ast: Type, environment: &Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
         Ok(match ast {
             Type::Symbol(symbol) => EvalResult::Type(
                 environment
+                    .deref()
                     .borrow()
                     .get(&symbol)
                     .ok_or(Error::NotFound(symbol.to_string()))?,
@@ -670,7 +786,21 @@ enum Type {
     Nil,
     Bool(bool),
     Keyword(String),
-    Function(Function),
+    Function(FunctionType),
+}
+
+#[derive(Clone)]
+enum FunctionType {
+    Regular(Function),
+    UserDefined(Box<UserDefined>),
+}
+
+#[derive(Clone)]
+struct UserDefined {
+    body: Type,
+    params: Type,
+    env: Rc<RefCell<Environment>>,
+    function: Function,
 }
 
 impl Debug for Type {
@@ -841,14 +971,6 @@ impl Type {
 
     const fn as_list(&self) -> Option<&Vec<Self>> {
         if let Self::List(v) = self {
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    fn as_function(&self) -> Option<&Function> {
-        if let Self::Function(v) = self {
             Some(v)
         } else {
             None
