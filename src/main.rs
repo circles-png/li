@@ -11,7 +11,6 @@ use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Edito
 use std::{
     cell::RefCell,
     collections::HashMap,
-    env::args,
     fmt::{self, Debug, Display, Formatter},
     fs::read_to_string,
     iter::{once, Extend},
@@ -271,7 +270,41 @@ impl Repl {
                 *atom.as_atom().unwrap().clone().borrow_mut() = result.clone();
                 result
             }),
-        ] as [(&str, &<Function as Deref>::Target); 16]
+            ("cons", &|values| {
+                Type::List(
+                    once((*values.first().unwrap()).clone())
+                        .chain(
+                            match values.get(1).unwrap() {
+                                Type::List(list) => list,
+                                Type::Vector(vector) => vector,
+                                _ => unimplemented!(),
+                            }
+                            .clone(),
+                        )
+                        .collect(),
+                )
+            }),
+            ("concat", &|values| {
+                Type::List(
+                    values
+                        .iter()
+                        .flat_map(|value| {
+                            match value {
+                                Type::List(list) => list,
+                                Type::Vector(vector) => vector,
+                                _ => unimplemented!(),
+                            }
+                            .clone()
+                        })
+                        .collect(),
+                )
+            }),
+            ("vec", &|values| match values.first().unwrap() {
+                Type::List(list) => Type::Vector(list.clone()),
+                vector @ Type::Vector(_) => (*vector).clone(),
+                _ => unimplemented!(),
+            }),
+        ] as [(&str, &<Function as Deref>::Target); 19]
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
@@ -422,6 +455,53 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
             return Ok(match ast {
                 Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
                 Type::List(_) => {
+                    fn quasiquote(ast: &Type) -> Type {
+                        let f = |items: &Vec<Type>| {
+                            let mut result = Vec::new();
+                            for item in items.iter().rev() {
+                                if let Some(list) = item.as_list() {
+                                    if list.first().map_or(false, |first| {
+                                        *first
+                                            == Type::Symbol(Token::Other(
+                                                "splice-unquote".to_string(),
+                                            ))
+                                    }) {
+                                        result = vec![
+                                            Type::Symbol(Token::Other("concat".to_string())),
+                                            list.get(1).unwrap().clone(),
+                                            Type::List(result),
+                                        ];
+                                        continue;
+                                    }
+                                }
+                                result = vec![
+                                    Type::Symbol(Token::Other("cons".to_string())),
+                                    quasiquote(item),
+                                    Type::List(result),
+                                ];
+                            }
+                            Type::List(result)
+                        };
+                        match ast {
+                            Type::Vector(vector) => Type::List(vec![
+                                Type::Symbol(Token::Other("vec".to_string())),
+                                f(vector),
+                            ]),
+                            Type::List(list) => {
+                                if list.first().map_or(false, |first| {
+                                    *first == Type::Symbol(Token::Other("unquote".to_string()))
+                                }) {
+                                    return list.get(1).unwrap().clone();
+                                }
+                                f(list)
+                            }
+                            Type::HashMap(_) | Type::Symbol(_) => Type::List(vec![
+                                Type::Symbol(Token::Other("quote".to_string())),
+                                ast.clone(),
+                            ]),
+                            _ => ast.clone(),
+                        }
+                    }
                     let unevaluated = ast.as_list().unwrap();
                     match unevaluated
                         .first()
@@ -512,6 +592,14 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 env: Rc::clone(&environment),
                             }),
                         ))),
+                        Some("quote") => EvalResult::Type(unevaluated.get(1).unwrap().clone()),
+                        Some("quasiquote") => {
+                            ast = quasiquote(unevaluated.get(1).unwrap());
+                            continue;
+                        }
+                        Some("quasiquoteexpand") => {
+                            EvalResult::Type(quasiquote(unevaluated.get(1).unwrap()))
+                        }
                         _ => {
                             let result = eval_ast(ast.clone(), &environment)?;
                             let evaluated = result.as_result_list().unwrap();
@@ -1063,7 +1151,7 @@ impl Type {
                 "({})",
                 items
                     .iter()
-                    .map(|value| dbg!(value.print(display, quote_strings)))
+                    .map(|value| value.print(display, quote_strings))
                     .collect_vec()
                     .join(" ")
             ),
