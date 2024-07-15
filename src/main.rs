@@ -3,8 +3,6 @@ use clap::Parser;
 use clap::ValueHint;
 use colored::Colorize;
 use core::mem::discriminant;
-use std::io::stdout;
-use std::io::Write;
 use enum_as_inner::EnumAsInner;
 use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
@@ -12,6 +10,9 @@ use itertools::{EitherOrBoth, Itertools};
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::convert::Into;
 use std::io::stdin;
+use std::io::stdout;
+use std::io::Write;
+use std::time::SystemTime;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -95,15 +96,18 @@ impl Repl {
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
-                Type::Function(FunctionType::Regular(Rc::new(move |values| {
-                    Ok(Type::Number(
-                        values
-                            .iter()
-                            .map(|value| *value.as_number().unwrap())
-                            .reduce(op)
-                            .unwrap(),
-                    ))
-                }))),
+                Type::Function(
+                    FunctionType::Regular(Rc::new(move |values| {
+                        Ok(Type::Number(
+                            values
+                                .iter()
+                                .map(|value| *value.as_number().unwrap())
+                                .reduce(op)
+                                .unwrap(),
+                        ))
+                    })),
+                    Box::new(Type::Nil),
+                ),
             );
         }
         for (symbol, function) in [
@@ -118,15 +122,18 @@ impl Repl {
                 Ok(Type::Nil)
             }),
             ("list", &|values| {
-                Ok(Type::List(values.iter().copied().cloned().collect()))
+                Ok(Type::List(
+                    values.iter().copied().cloned().collect(),
+                    Box::new(Type::Nil),
+                ))
             }),
             ("list?", &|values| {
                 Ok(Type::Bool(values.first().unwrap().is_list()))
             }),
             ("empty?", &|values| {
                 Ok(Type::Bool(match values.first().unwrap() {
-                    Type::List(list) => list.is_empty(),
-                    Type::Vector(vector) => vector.is_empty(),
+                    Type::List(list, _) => list.is_empty(),
+                    Type::Vector(vector, _) => vector.is_empty(),
                     _ => unimplemented!(),
                 }))
             }),
@@ -135,8 +142,8 @@ impl Repl {
                     #[allow(clippy::cast_precision_loss)]
                     Type::Number(
                         (match values.first().unwrap() {
-                            Type::List(list) => list.len(),
-                            Type::Vector(vector) => vector.len(),
+                            Type::List(list, _) => list.len(),
+                            Type::Vector(vector, _) => vector.len(),
                             Type::Nil => 0,
                             _ => unimplemented!(),
                         }) as f64,
@@ -222,7 +229,7 @@ impl Repl {
                 }
                 arguments.extend(args.iter().copied().cloned());
                 let arguments = arguments.iter().collect_vec();
-                let result = match function.as_function().unwrap() {
+                let result = match function.as_function().unwrap().0 {
                     FunctionType::Regular(function) => Rc::clone(function)(&arguments),
                     FunctionType::UserDefined(function) => (function.function)(&arguments),
                 };
@@ -237,13 +244,14 @@ impl Repl {
                     once((*values.first().unwrap()).clone())
                         .chain(
                             match values.get(1).unwrap() {
-                                Type::List(list) => list,
-                                Type::Vector(vector) => vector,
+                                Type::List(list, _) => list,
+                                Type::Vector(vector, _) => vector,
                                 _ => unimplemented!(),
                             }
                             .clone(),
                         )
                         .collect(),
+                    Box::new(Type::Nil),
                 ))
             }),
             ("concat", &|values| {
@@ -252,24 +260,25 @@ impl Repl {
                         .iter()
                         .flat_map(|value| {
                             match value {
-                                Type::List(list) => list,
-                                Type::Vector(vector) => vector,
+                                Type::List(list, _) => list,
+                                Type::Vector(vector, _) => vector,
                                 _ => unimplemented!(),
                             }
                             .clone()
                         })
                         .collect(),
+                    Box::new(Type::Nil),
                 ))
             }),
             ("vec", &|values| match values.first().unwrap() {
-                Type::List(list) => Ok(Type::Vector(list.clone())),
-                vector @ Type::Vector(_) => Ok((*vector).clone()),
+                Type::List(list, _) => Ok(Type::Vector(list.clone(), Box::new(Type::Nil))),
+                vector @ Type::Vector(_, _) => Ok((*vector).clone()),
                 _ => unimplemented!(),
             }),
             ("nth", &|values| {
                 let items = match values.first().unwrap() {
-                    Type::List(list) => list,
-                    Type::Vector(vector) => vector,
+                    Type::List(list, _) => list,
+                    Type::Vector(vector, _) => vector,
                     _ => unimplemented!(),
                 };
                 let number = values.get(1).unwrap().as_number().unwrap();
@@ -283,8 +292,8 @@ impl Repl {
             }),
             ("first", &|values| {
                 let items = match values.first().unwrap() {
-                    Type::List(list) => list,
-                    Type::Vector(vector) => vector,
+                    Type::List(list, _) => list,
+                    Type::Vector(vector, _) => vector,
                     Type::Nil => return Ok(Type::Nil),
                     _ => unimplemented!(),
                 };
@@ -292,27 +301,30 @@ impl Repl {
             }),
             ("rest", &|values| {
                 let items = match values.first().unwrap() {
-                    Type::List(list) if list.is_empty() => return Ok(Type::List(Vec::new())),
-                    Type::Nil => return Ok(Type::List(Vec::new())),
-                    Type::List(list) => list,
-                    Type::Vector(vector) => vector,
+                    Type::List(list, _) if list.is_empty() => {
+                        return Ok(Type::List(Vec::new(), Box::new(Type::Nil)))
+                    }
+                    Type::Nil => return Ok(Type::List(Vec::new(), Box::new(Type::Nil))),
+                    Type::List(list, _) => list,
+                    Type::Vector(vector, _) => vector,
                     _ => unimplemented!(),
                 };
                 Ok(Type::List(
                     items.get(1..).map_or(Vec::new(), <[Type]>::to_vec),
+                    Box::new(Type::Nil),
                 ))
             }),
             ("throw", &|values| {
                 Err(Error::Custom((*values.first().unwrap()).clone()))
             }),
             ("apply", &|values| {
-                let function = values.first().unwrap().as_function().unwrap();
+                let function = values.first().unwrap().as_function().unwrap().0;
                 let values = values[1..values.len() - 1]
                     .iter()
                     .copied()
                     .chain(match values.last().unwrap() {
-                        Type::List(list) => list,
-                        Type::Vector(vector) => vector,
+                        Type::List(list, _) => list,
+                        Type::Vector(vector, _) => vector,
                         _ => unimplemented!(),
                     })
                     .collect_vec();
@@ -322,10 +334,10 @@ impl Repl {
                 }
             }),
             ("map", &|values| {
-                let function = values.first().unwrap().as_function().unwrap();
+                let function = values.first().unwrap().as_function().unwrap().0;
                 let items = match values.get(1).unwrap() {
-                    Type::List(list) => list,
-                    Type::Vector(vector) => vector,
+                    Type::List(list, _) => list,
+                    Type::Vector(vector, _) => vector,
                     _ => unimplemented!(),
                 };
                 Ok(Type::List(
@@ -338,6 +350,7 @@ impl Repl {
                             }
                         })
                         .try_collect()?,
+                    Box::new(Type::Nil),
                 ))
             }),
             ("nil?", &|values| {
@@ -372,7 +385,10 @@ impl Repl {
                 Ok(Type::Bool(values.first().unwrap().is_keyword()))
             }),
             ("vector", &|values| {
-                Ok(Type::Vector(values.iter().copied().cloned().collect()))
+                Ok(Type::Vector(
+                    values.iter().copied().cloned().collect(),
+                    Box::new(Type::Nil),
+                ))
             }),
             ("vector?", &|values| {
                 Ok(Type::Bool(values.first().unwrap().is_vector()))
@@ -390,13 +406,14 @@ impl Repl {
                     pairs
                         .map(|pair| pair[0].clone().try_into().map(|key| (key, pair[1].clone())))
                         .try_collect::<_, IndexMap<_, _>, _>()?,
+                    Box::new(Type::Nil),
                 ))
             }),
             ("map?", &|values| {
                 Ok(Type::Bool(values.first().unwrap().is_hash_map()))
             }),
             ("assoc", &|values| {
-                let hash_map = values.first().unwrap().as_hash_map().unwrap();
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().0;
                 let pairs = values[1..].chunks_exact(2);
                 if let Some(key) = pairs.remainder().first() {
                     return Err(Error::MissingHashMapValue((*key).clone().try_into()?));
@@ -409,33 +426,46 @@ impl Repl {
                             pair[0].clone().try_into().map(|key| (key, pair[1].clone()))
                         }))
                         .try_collect::<_, IndexMap<_, _>, _>()?,
+                    Box::new(Type::Nil),
                 ))
             }),
             ("dissoc", &|values| {
-                let mut hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                let mut hash_map = values.first().unwrap().as_hash_map().unwrap().0.clone();
                 let keys = &values[1..];
                 hash_map.retain(|key, _| !keys.contains(&&Type::from(key.clone())));
-                Ok(Type::HashMap(hash_map))
+                Ok(Type::HashMap(hash_map.clone(), Box::new(Type::Nil)))
             }),
             ("get", &|values| {
-                let Some(hash_map) = values.first().unwrap().as_hash_map().cloned() else {
+                let Some(hash_map) = values
+                    .first()
+                    .unwrap()
+                    .as_hash_map()
+                    .map(|(hash_map, _)| hash_map)
+                    .cloned()
+                else {
                     return Ok(Type::Nil);
                 };
                 let key = HashMapKey::try_from((*values.get(1).unwrap()).clone())?;
                 Ok(hash_map.get(&key).unwrap_or(&Type::Nil).clone())
             }),
             ("contains?", &|values| {
-                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().0;
                 let key = HashMapKey::try_from((*values.get(1).unwrap()).clone())?;
                 Ok(Type::Bool(hash_map.contains_key(&key)))
             }),
             ("keys", &|values| {
-                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
-                Ok(Type::List(hash_map.into_keys().map(Into::into).collect()))
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().0.clone();
+                Ok(Type::List(
+                    hash_map.into_keys().map(Into::into).collect(),
+                    Box::new(Type::Nil),
+                ))
             }),
             ("vals", &|values| {
-                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
-                Ok(Type::List(hash_map.into_values().collect()))
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().0.clone();
+                Ok(Type::List(
+                    hash_map.into_values().collect(),
+                    Box::new(Type::Nil),
+                ))
             }),
             ("readline", &|values| {
                 let mut buffer = String::new();
@@ -446,19 +476,125 @@ impl Repl {
                 }
                 Ok(Type::String(buffer[..buffer.len() - 1].to_string()))
             }),
-            ("time-ms", &|_| todo!()),
-            ("meta", &|_| todo!()),
-            ("with-meta", &|_| todo!()),
-            ("fn?", &|_| todo!()),
-            ("string?", &|_| todo!()),
-            ("number?", &|_| todo!()),
-            ("seq", &|_| todo!()),
-            ("conj", &|_| todo!()),
-        ] as [(&str, &<Function as Deref>::Target); 52]
+            ("time-ms", &|_| {
+                const NANOS_PER_MILLI: f64 = 1_000_000.;
+                const MILLIS_PER_SEC: f64 = 1_000.;
+                let duration = &SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap();
+                Ok(Type::Number(
+                    #[allow(clippy::cast_precision_loss)]
+                    (duration.as_secs() as f64).mul_add(
+                        MILLIS_PER_SEC,
+                        f64::from(duration.subsec_nanos()) / NANOS_PER_MILLI,
+                    ),
+                ))
+            }),
+            ("meta", &|values| match values.first().unwrap() {
+                Type::Function(_, metadata)
+                | Type::List(_, metadata)
+                | Type::Vector(_, metadata)
+                | Type::HashMap(_, metadata) => Ok(metadata.deref().clone()),
+                _ => unimplemented!(),
+            }),
+            ("with-meta", &|values| {
+                let mut value = (*values.first().unwrap()).clone();
+                let set = (*values.get(1).unwrap()).clone();
+                match &mut value {
+                    Type::Function(_, metadata)
+                    | Type::List(_, metadata)
+                    | Type::Vector(_, metadata)
+                    | Type::HashMap(_, metadata) => **metadata = set,
+                    _ => unimplemented!(),
+                }
+                Ok(value)
+            }),
+            ("fn?", &|values| {
+                Ok(Type::Bool(
+                    values.first().unwrap().as_function().is_some_and(
+                        |(function, _)| match function {
+                            FunctionType::Regular(_) => true,
+                            FunctionType::UserDefined(function) => !function.is_macro,
+                        },
+                    ),
+                ))
+            }),
+            ("string?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_string()))
+            }),
+            ("number?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_number()))
+            }),
+            ("macro?", &|values| {
+                Ok(Type::Bool(
+                    values
+                        .first()
+                        .unwrap()
+                        .as_function()
+                        .is_some_and(|(function, _)| {
+                            function
+                                .as_user_defined()
+                                .is_some_and(|function| function.is_macro)
+                        }),
+                ))
+            }),
+            ("seq", &|values| {
+                Ok(match values.first().unwrap() {
+                    value @ Type::List(list, _) => {
+                        if list.is_empty() {
+                            Type::Nil
+                        } else {
+                            (*value).clone()
+                        }
+                    }
+                    Type::Vector(vector, _) => {
+                        if vector.is_empty() {
+                            Type::Nil
+                        } else {
+                            Type::List(vector.clone(), Box::new(Type::Nil))
+                        }
+                    }
+                    Type::String(string) => {
+                        if string.is_empty() {
+                            Type::Nil
+                        } else {
+                            Type::List(
+                                string
+                                    .chars()
+                                    .map(|char| Type::String(char.to_string()))
+                                    .collect(),
+                                Box::new(Type::Nil),
+                            )
+                        }
+                    }
+                    Type::Nil => Type::Nil,
+                    _ => unimplemented!(),
+                })
+            }),
+            ("conj", &|values| {
+                let collection = values.first().unwrap();
+                let new = values[1..].iter().copied().cloned();
+                Ok(match collection {
+                    Type::List(list, _) => {
+                        let list = new.rev().chain(list.iter().cloned()).collect();
+                        Type::List(list, Box::new(Type::Nil))
+                    }
+                    Type::Vector(vector, _) => {
+                        let mut vector = vector.clone();
+                        vector.extend(new);
+                        Type::Vector(vector.clone(), Box::new(Type::Nil))
+                    }
+                    _ => unimplemented!(),
+                })
+            }),
+        ] as [(&str, &<Function as Deref>::Target); 53]
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
-                Type::Function(FunctionType::Regular(Rc::new(function))),
+                Type::Function(
+                    FunctionType::Regular(Rc::new(function)),
+                    Box::new(Type::Nil),
+                ),
             );
         }
         for (symbol, op) in [
@@ -470,32 +606,39 @@ impl Repl {
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
-                Type::Function(FunctionType::Regular(Rc::new(|values| {
-                    Ok(Type::Bool(op(
-                        *values.first().unwrap().as_number().unwrap(),
-                        *values.get(1).unwrap().as_number().unwrap(),
-                    )))
-                }))),
+                Type::Function(
+                    FunctionType::Regular(Rc::new(|values| {
+                        Ok(Type::Bool(op(
+                            *values.first().unwrap().as_number().unwrap(),
+                            *values.get(1).unwrap().as_number().unwrap(),
+                        )))
+                    })),
+                    Box::new(Type::Nil),
+                ),
             );
         }
         environment.deref().borrow_mut().set(
             Token::Other("eval".to_string()),
-            Type::Function(FunctionType::Regular(Rc::new({
-                let environment = Rc::clone(&environment);
-                move |ast| {
-                    Ok(
-                        eval((*ast.first().unwrap()).clone(), Rc::clone(&environment))
-                            .unwrap()
-                            .as_type()
-                            .unwrap()
-                            .clone(),
-                    )
-                }
-            }))),
+            Type::Function(
+                FunctionType::Regular(Rc::new({
+                    let environment = Rc::clone(&environment);
+                    move |ast| {
+                        Ok(
+                            eval((*ast.first().unwrap()).clone(), Rc::clone(&environment))
+                                .unwrap()
+                                .as_type()
+                                .unwrap()
+                                .clone(),
+                        )
+                    }
+                })),
+                Box::new(Type::Nil),
+            ),
         );
-        environment
-            .borrow_mut()
-            .set(Token::Other("*ARGV*".to_string()), Type::List(Vec::new()));
+        environment.borrow_mut().set(
+            Token::Other("*ARGV*".to_string()),
+            Type::List(Vec::new(), Box::new(Type::Nil)),
+        );
         environment.deref().borrow_mut().set(
             Token::Other("*host-language*".to_string()),
             Type::String("Rust".to_string()),
@@ -532,6 +675,7 @@ impl Repl {
                         .iter()
                         .map(|value| Type::String(value.clone()))
                         .collect(),
+                    Box::new(Type::Nil),
                 ),
             );
             match run(format!("(load-file \"{}\")", file.display())) {
@@ -610,13 +754,13 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
     fn eval(mut ast: Type, mut environment: Rc<RefCell<Environment>>) -> Result<EvalResult, Error> {
         loop {
             return Ok(match ast {
-                Type::List(ref list) if list.is_empty() => EvalResult::Type(ast),
-                Type::List(_) => {
+                Type::List(ref list, _) if list.is_empty() => EvalResult::Type(ast),
+                Type::List(_, _) => {
                     fn quasiquote(ast: &Type) -> Type {
                         let f = |items: &Vec<Type>| {
                             let mut result = Vec::new();
                             for item in items.iter().rev() {
-                                if let Some(list) = item.as_list() {
+                                if let Some((list, _)) = item.as_list() {
                                     if list.first().map_or(false, |first| {
                                         *first
                                             == Type::Symbol(Token::Other(
@@ -626,7 +770,7 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                         result = vec![
                                             Type::Symbol(Token::Other("concat".to_string())),
                                             list.get(1).unwrap().clone(),
-                                            Type::List(result),
+                                            Type::List(result, Box::new(Type::Nil)),
                                         ];
                                         continue;
                                     }
@@ -634,17 +778,17 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 result = vec![
                                     Type::Symbol(Token::Other("cons".to_string())),
                                     quasiquote(item),
-                                    Type::List(result),
+                                    Type::List(result, Box::new(Type::Nil)),
                                 ];
                             }
-                            Type::List(result)
+                            Type::List(result, Box::new(Type::Nil))
                         };
                         match ast {
-                            Type::Vector(vector) => Type::List(vec![
-                                Type::Symbol(Token::Other("vec".to_string())),
-                                f(vector),
-                            ]),
-                            Type::List(list) => {
+                            Type::Vector(vector, _) => Type::List(
+                                vec![Type::Symbol(Token::Other("vec".to_string())), f(vector)],
+                                Box::new(Type::Nil),
+                            ),
+                            Type::List(list, _) => {
                                 if list.first().map_or(false, |first| {
                                     *first == Type::Symbol(Token::Other("unquote".to_string()))
                                 }) {
@@ -652,19 +796,19 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 }
                                 f(list)
                             }
-                            Type::HashMap(_) | Type::Symbol(_) => Type::List(vec![
-                                Type::Symbol(Token::Other("quote".to_string())),
-                                ast.clone(),
-                            ]),
+                            Type::HashMap(_, _) | Type::Symbol(_) => Type::List(
+                                vec![Type::Symbol(Token::Other("quote".to_string())), ast.clone()],
+                                Box::new(Type::Nil),
+                            ),
                             _ => ast.clone(),
                         }
                     }
                     fn is_macro_call(ast: &Type, environment: &Rc<RefCell<Environment>>) -> bool {
-                        ast.as_list().is_some_and(|list| {
+                        ast.as_list().is_some_and(|(list, _)| {
                             list.first().is_some_and(|item| {
                                 item.as_symbol().is_some_and(|symbol| {
                                     environment.borrow().get(symbol).is_some_and(|value| {
-                                        value.as_function().is_some_and(|function| {
+                                        value.as_function().is_some_and(|(function, _)| {
                                             function
                                                 .as_user_defined()
                                                 .is_some_and(|function| function.is_macro)
@@ -679,15 +823,24 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                         while is_macro_call(&ast, environment) {
                             ast = (environment
                                 .borrow()
-                                .get(ast.as_list().unwrap().first().unwrap().as_symbol().unwrap())
+                                .get(
+                                    ast.as_list()
+                                        .unwrap()
+                                        .0
+                                        .first()
+                                        .unwrap()
+                                        .as_symbol()
+                                        .unwrap(),
+                                )
                                 .unwrap()
                                 .as_function()
                                 .unwrap()
+                                .0
                                 .as_user_defined()
                                 .unwrap()
                                 .deref()
                                 .function)(
-                                &ast.as_list().unwrap()[1..].iter().collect_vec()
+                                &ast.as_list().unwrap().0[1..].iter().collect_vec()
                             )
                             .unwrap();
                         }
@@ -697,7 +850,7 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                     if !ast.is_list() {
                         return eval_ast(ast, &environment);
                     }
-                    let unevaluated = ast.as_list().unwrap();
+                    let unevaluated = ast.as_list().unwrap().0.clone();
                     match unevaluated
                         .first()
                         .unwrap()
@@ -722,8 +875,8 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                             new.outer = Some(Rc::clone(&environment));
                             let new = Rc::new(RefCell::new(new));
                             let pairs = match unevaluated.get(1).unwrap() {
-                                Type::List(list) => list,
-                                Type::Vector(vector) => vector,
+                                Type::List(list, _) => list,
+                                Type::Vector(vector, _) => vector,
                                 _ => unimplemented!("error"),
                             }
                             .chunks_exact(2);
@@ -751,12 +904,15 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                         }
                         Some("do") => {
                             eval_ast(
-                                Type::List(unevaluated[1..unevaluated.len() - 1].to_vec()),
+                                Type::List(
+                                    unevaluated[1..unevaluated.len() - 1].to_vec(),
+                                    Box::new(Type::Nil),
+                                ),
                                 &environment,
                             )?
                             .as_result_list()
                             .unwrap();
-                            ast = ast.as_list().unwrap().last().unwrap().clone();
+                            ast = ast.as_list().unwrap().0.last().unwrap().clone();
                             continue;
                         }
                         Some("if") => {
@@ -780,10 +936,10 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 None => EvalResult::Type(Type::Nil),
                             }
                         }
-                        Some("fn*") => EvalResult::Type(Type::Function(FunctionType::UserDefined(
-                            Box::new(UserDefined {
-                                body: ast.as_list().unwrap().get(2).unwrap().clone(),
-                                params: ast.as_list().unwrap().get(1).unwrap().clone(),
+                        Some("fn*") => EvalResult::Type(Type::Function(
+                            FunctionType::UserDefined(Box::new(UserDefined {
+                                body: unevaluated.get(2).unwrap().clone(),
+                                params: unevaluated.get(1).unwrap().clone(),
                                 env: Rc::clone(&environment),
                                 function: Rc::new(move |values| {
                                     enum BindRest<'a> {
@@ -791,14 +947,14 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                         BindEmpty,
                                         BindFirstValue(&'a Type),
                                     }
-                                    let body = ast.as_list().unwrap().get(2).unwrap();
-                                    let params = ast.as_list().unwrap().get(1).unwrap();
+                                    let body = unevaluated.get(2).unwrap();
+                                    let params = unevaluated.get(1).unwrap();
                                     let mut new = Environment::new();
                                     new.outer = Some(Rc::clone(&environment));
                                     let new = Rc::new(RefCell::new(new));
                                     let mut bindings = match params {
-                                        Type::List(list) => list,
-                                        Type::Vector(vector) => vector,
+                                        Type::List(list, _) => list,
+                                        Type::Vector(vector, _) => vector,
                                         _ => unimplemented!(),
                                     }
                                     .iter()
@@ -832,9 +988,10 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                         BindRest::None => {}
                                         BindRest::BindEmpty => {
                                             let next = bindings.next().unwrap();
-                                            new.deref()
-                                                .borrow_mut()
-                                                .set(next, Type::List(Vec::new()));
+                                            new.deref().borrow_mut().set(
+                                                next,
+                                                Type::List(Vec::new(), Box::new(Type::Nil)),
+                                            );
                                         }
                                         BindRest::BindFirstValue(first_value) => {
                                             let next = bindings.next().unwrap();
@@ -842,14 +999,17 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                                 .chain(values)
                                                 .cloned()
                                                 .collect_vec();
-                                            new.deref().borrow_mut().set(next, Type::List(rest));
+                                            new.deref()
+                                                .borrow_mut()
+                                                .set(next, Type::List(rest, Box::new(Type::Nil)));
                                         }
                                     }
                                     Ok(eval(body.clone(), new).unwrap().as_type().unwrap().clone())
                                 }),
                                 is_macro: false,
-                            }),
-                        ))),
+                            })),
+                            Box::new(Type::Nil),
+                        )),
                         Some("quote") => EvalResult::Type(unevaluated.get(1).unwrap().clone()),
                         Some("quasiquote") => {
                             ast = quasiquote(unevaluated.get(1).unwrap());
@@ -866,12 +1026,14 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 match result {
                                     EvalResult::Type(Type::Function(
                                         FunctionType::UserDefined(ref function),
-                                    )) => Type::Function(FunctionType::UserDefined(Box::new(
-                                        UserDefined {
+                                        _,
+                                    )) => Type::Function(
+                                        FunctionType::UserDefined(Box::new(UserDefined {
                                             is_macro: true,
                                             ..*(*function).clone()
-                                        },
-                                    ))),
+                                        })),
+                                        Box::new(Type::Nil),
+                                    ),
                                     EvalResult::Type(ref v) => v.clone(),
                                     EvalResult::ResultList(_) => unimplemented!(),
                                 },
@@ -892,7 +1054,7 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                     let new = Rc::new(RefCell::new(new));
                                     let catch = unevaluated.get(2);
                                     if let Some(catch) = catch {
-                                        let catch = catch.as_list().unwrap();
+                                        let catch = catch.as_list().unwrap().0;
                                         new.borrow_mut().set(
                                             catch.get(1).unwrap().as_symbol().unwrap().clone(),
                                             error
@@ -914,18 +1076,20 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                 unimplemented!()
                             };
                             match function {
-                                EvalResult::Type(Type::Function(FunctionType::Regular(
-                                    function,
-                                ))) => EvalResult::Type(Rc::clone(function)(
+                                EvalResult::Type(Type::Function(
+                                    FunctionType::Regular(function),
+                                    _,
+                                )) => EvalResult::Type(Rc::clone(function)(
                                     &evaluated
                                         .iter()
                                         .skip(1)
                                         .map(|item| item.as_type().unwrap())
                                         .collect_vec(),
                                 )?),
-                                EvalResult::Type(Type::Function(FunctionType::UserDefined(
-                                    function,
-                                ))) => {
+                                EvalResult::Type(Type::Function(
+                                    FunctionType::UserDefined(function),
+                                    _,
+                                )) => {
                                     enum BindRest<'a> {
                                         None,
                                         BindEmpty,
@@ -939,8 +1103,8 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                     new.outer = Some(Rc::clone(env));
                                     let new = Rc::new(RefCell::new(new));
                                     let mut bindings = match params {
-                                        Type::List(list) => list,
-                                        Type::Vector(vector) => vector,
+                                        Type::List(list, _) => list,
+                                        Type::Vector(vector, _) => vector,
                                         _ => unimplemented!(),
                                     }
                                     .iter()
@@ -975,9 +1139,10 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                         BindRest::None => {}
                                         BindRest::BindEmpty => {
                                             let next = bindings.next().unwrap();
-                                            new.deref()
-                                                .borrow_mut()
-                                                .set(next, Type::List(Vec::new()));
+                                            new.deref().borrow_mut().set(
+                                                next,
+                                                Type::List(Vec::new(), Box::new(Type::Nil)),
+                                            );
                                         }
                                         BindRest::BindFirstValue(first_value) => {
                                             let next = bindings.next().unwrap();
@@ -985,7 +1150,9 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                                                 .chain(once(first_value))
                                                 .cloned()
                                                 .collect_vec();
-                                            new.deref().borrow_mut().set(next, Type::List(rest));
+                                            new.deref()
+                                                .borrow_mut()
+                                                .set(next, Type::List(rest, Box::new(Type::Nil)));
                                         }
                                     }
                                     environment = new;
@@ -1010,12 +1177,12 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                     .get(&symbol)
                     .ok_or(Error::OperatorNotFound(symbol.to_string()))?,
             ),
-            Type::List(list) => EvalResult::ResultList(
+            Type::List(list, _) => EvalResult::ResultList(
                 list.iter()
                     .map(|item| eval(item.clone(), Rc::clone(environment)))
                     .try_collect()?,
             ),
-            Type::Vector(vector) => EvalResult::Type(Type::Vector(
+            Type::Vector(vector, _) => EvalResult::Type(Type::Vector(
                 vector
                     .into_iter()
                     .map(|item| {
@@ -1023,8 +1190,9 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                             .map(|result| result.as_type().unwrap().clone())
                     })
                     .try_collect()?,
+                Box::new(Type::Nil),
             )),
-            Type::HashMap(hash_map) => EvalResult::Type(Type::HashMap(
+            Type::HashMap(hash_map, _) => EvalResult::Type(Type::HashMap(
                 hash_map
                     .into_iter()
                     .map(|(key, value)| {
@@ -1032,6 +1200,7 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                             .map(|value| (key, value.as_type().unwrap().clone()))
                     })
                     .try_collect()?,
+                Box::new(Type::Nil),
             )),
             _ => EvalResult::Type(ast.clone()),
         })
@@ -1278,16 +1447,16 @@ impl From<HashMapKey> for Type {
 
 #[derive(Clone, EnumAsInner)]
 enum Type {
-    List(Vec<Type>),
-    Vector(Vec<Type>),
-    HashMap(IndexMap<HashMapKey, Type>),
+    List(Vec<Type>, Box<Type>),
+    Vector(Vec<Type>, Box<Type>),
+    HashMap(IndexMap<HashMapKey, Type>, Box<Type>),
     Symbol(Token),
     String(String),
     Number(f64),
     Nil,
     Bool(bool),
     Keyword(String),
-    Function(FunctionType),
+    Function(FunctionType, Box<Type>),
     Atom(Rc<RefCell<Type>>),
 }
 
@@ -1309,16 +1478,16 @@ struct UserDefined {
 impl Debug for Type {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::List(arg0) => f.debug_tuple("List").field(arg0).finish(),
-            Self::Vector(arg0) => f.debug_tuple("Vector").field(arg0).finish(),
-            Self::HashMap(arg0) => f.debug_tuple("HashMap").field(arg0).finish(),
+            Self::List(arg0, _) => f.debug_tuple("List").field(arg0).finish(),
+            Self::Vector(arg0, _) => f.debug_tuple("Vector").field(arg0).finish(),
+            Self::HashMap(arg0, _) => f.debug_tuple("HashMap").field(arg0).finish(),
             Self::Symbol(arg0) => f.debug_tuple("Symbol").field(arg0).finish(),
             Self::String(arg0) => f.debug_tuple("String").field(arg0).finish(),
             Self::Number(arg0) => f.debug_tuple("Number").field(arg0).finish(),
             Self::Nil => write!(f, "Nil"),
             Self::Bool(arg0) => f.debug_tuple("Bool").field(arg0).finish(),
             Self::Keyword(arg0) => f.debug_tuple("Keyword").field(arg0).finish(),
-            Self::Function(_) => write!(f, "Function"),
+            Self::Function(_, _) => write!(f, "Function"),
             Self::Atom(atom) => f.debug_tuple("Atom").field(&&**atom).finish(),
         }
     }
@@ -1327,13 +1496,15 @@ impl Debug for Type {
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Vector(a) | Self::List(a), Self::Vector(b) | Self::List(b)) => a == b,
-            (Self::HashMap(a), Self::HashMap(b)) => a == b,
+            (Self::Vector(a, _) | Self::List(a, _), Self::Vector(b, _) | Self::List(b, _)) => {
+                a == b
+            }
+            (Self::HashMap(a, _), Self::HashMap(b, _)) => a == b,
             (Self::Symbol(a), Self::Symbol(b)) => a == b,
             (Self::String(a), Self::String(b)) | (Self::Keyword(a), Self::Keyword(b)) => a == b,
             (Self::Number(a), Self::Number(b)) => a == b,
             (Self::Bool(a), Self::Bool(b)) => a == b,
-            (Self::Function(_), Self::Function(_)) => false,
+            (Self::Function(_, _), Self::Function(_, _)) => false,
             _ => discriminant(self) == discriminant(other),
         }
     }
@@ -1380,7 +1551,10 @@ impl Type {
                     input = &input[len..];
                     items.push(item);
                 }
-                (Self::List(items), original_len - input.len() + 1)
+                (
+                    Self::List(items, Box::new(Self::Nil)),
+                    original_len - input.len() + 1,
+                )
             }
             Token::LeftSquare => {
                 let original_len = input.len();
@@ -1394,7 +1568,10 @@ impl Type {
                     input = &input[len..];
                     items.push(item);
                 }
-                (Self::Vector(items), original_len - input.len() + 1)
+                (
+                    Self::Vector(items, Box::new(Self::Nil)),
+                    original_len - input.len() + 1,
+                )
             }
             Token::LeftBrace => {
                 let original_len = input.len();
@@ -1420,26 +1597,47 @@ impl Type {
                 if let Some(key) = key {
                     return Err(Error::MissingHashMapValue(key));
                 }
-                (Self::HashMap(items), original_len - input.len() + 1)
+                (
+                    Self::HashMap(items, Box::new(Self::Nil)),
+                    original_len - input.len() + 1,
+                )
             }
             Token::SingleQuote | Token::Backtick | Token::Tilde | Token::TildeAt | Token::At => {
                 let (parameter, len) = Self::from_tokens(&input[1..])?;
                 (
-                    Self::List(vec![
-                        Self::Symbol(Token::Other(
-                            match first {
-                                Token::SingleQuote => "quote",
-                                Token::Backtick => "quasiquote",
-                                Token::Tilde => "unquote",
-                                Token::TildeAt => "splice-unquote",
-                                Token::At => "deref",
-                                _ => unreachable!(),
-                            }
-                            .to_string(),
-                        )),
-                        parameter,
-                    ]),
+                    Self::List(
+                        vec![
+                            Self::Symbol(Token::Other(
+                                match first {
+                                    Token::SingleQuote => "quote",
+                                    Token::Backtick => "quasiquote",
+                                    Token::Tilde => "unquote",
+                                    Token::TildeAt => "splice-unquote",
+                                    Token::At => "deref",
+                                    _ => unreachable!(),
+                                }
+                                .to_string(),
+                            )),
+                            parameter,
+                        ],
+                        Box::new(Self::Nil),
+                    ),
                     len + 1,
+                )
+            }
+            Token::Caret => {
+                let (set, len1) = Self::from_tokens(&input[1..])?;
+                let (value, len2) = Self::from_tokens(&input[(1 + len1)..])?;
+                (
+                    Self::List(
+                        vec![
+                            Self::Symbol(Token::Other("with-meta".to_string())),
+                            value,
+                            set,
+                        ],
+                        Box::new(Self::Nil),
+                    ),
+                    len1 + len2 + 1,
                 )
             }
             _ => (
@@ -1473,7 +1671,7 @@ impl Type {
             Self::Symbol(symbol) => symbol.to_string(),
             Self::Nil => "nil".to_string(),
             Self::Bool(bool) => bool.to_string(),
-            Self::List(items) => format!(
+            Self::List(items, _) => format!(
                 "({})",
                 items
                     .iter()
@@ -1481,7 +1679,7 @@ impl Type {
                     .collect_vec()
                     .join(" ")
             ),
-            Self::Vector(items) => format!(
+            Self::Vector(items, _) => format!(
                 "[{}]",
                 items
                     .iter()
@@ -1489,7 +1687,7 @@ impl Type {
                     .collect_vec()
                     .join(" ")
             ),
-            Self::HashMap(items) => format!(
+            Self::HashMap(items, _) => format!(
                 "{{{}}}",
                 items
                     .iter()
@@ -1498,7 +1696,7 @@ impl Type {
                     .join(" ")
             ),
             Self::Keyword(string) => format!(":{string}"),
-            Self::Function(_) => "#<function>".to_string(),
+            Self::Function(_, _) => "#<function>".to_string(),
             Self::String(string) => {
                 let string = if display {
                     string.clone()
