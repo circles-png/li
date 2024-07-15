@@ -8,6 +8,7 @@ use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
 use itertools::{EitherOrBoth, Itertools};
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
+use std::convert::Into;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -298,7 +299,142 @@ impl Repl {
                     items.get(1..).map_or(Vec::new(), <[Type]>::to_vec),
                 ))
             }),
-        ] as [(&str, &<Function as Deref>::Target); 22]
+            ("throw", &|values| {
+                Err(Error::Custom((*values.first().unwrap()).clone()))
+            }),
+            ("apply", &|values| {
+                let function = values.first().unwrap().as_function().unwrap();
+                let values = values[1..values.len() - 1]
+                    .iter()
+                    .copied()
+                    .chain(match values.last().unwrap() {
+                        Type::List(list) => list,
+                        Type::Vector(vector) => vector,
+                        _ => unimplemented!(),
+                    })
+                    .collect_vec();
+                match function {
+                    FunctionType::Regular(function) => (**function)(&values),
+                    FunctionType::UserDefined(function) => (*function.deref().function)(&values),
+                }
+            }),
+            ("map", &|values| {
+                let function = values.first().unwrap().as_function().unwrap();
+                let items = match values.get(1).unwrap() {
+                    Type::List(list) => list,
+                    Type::Vector(vector) => vector,
+                    _ => unimplemented!(),
+                };
+                Ok(Type::List(
+                    items
+                        .iter()
+                        .map(|item| match function {
+                            FunctionType::Regular(function) => (**function)(&[item]),
+                            FunctionType::UserDefined(function) => {
+                                (*function.deref().function)(&[item])
+                            }
+                        })
+                        .try_collect()?,
+                ))
+            }),
+            ("nil?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_nil()))
+            }),
+            ("true?", &|values| {
+                Ok(Type::Bool(
+                    values.first().unwrap().as_bool().is_some_and(|bool| *bool),
+                ))
+            }),
+            ("false?", &|values| {
+                Ok(Type::Bool(
+                    values.first().unwrap().as_bool().is_some_and(|bool| !*bool),
+                ))
+            }),
+            ("symbol?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_symbol()))
+            }),
+            ("symbol", &|values| {
+                Ok(Type::Symbol(Token::Other(
+                    values.first().unwrap().as_string().unwrap().clone(),
+                )))
+            }),
+            ("keyword", &|values| {
+                let first = values.first().unwrap();
+                if first.is_keyword() {
+                    return Ok((*first).clone());
+                }
+                Ok(Type::Keyword(first.as_string().unwrap().clone()))
+            }),
+            ("keyword?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_keyword()))
+            }),
+            ("vector", &|values| {
+                Ok(Type::Vector(values.iter().copied().cloned().collect()))
+            }),
+            ("vector?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_vector()))
+            }),
+            ("sequential?", &|values| {
+                let value = values.first().unwrap();
+                Ok(Type::Bool(value.is_vector() || value.is_list()))
+            }),
+            ("hash-map", &|values| {
+                let pairs = values.chunks_exact(2);
+                if let Some(key) = pairs.remainder().first() {
+                    return Err(Error::MissingHashMapValue((*key).clone().try_into()?));
+                }
+                Ok(Type::HashMap(
+                    pairs
+                        .map(|pair| pair[0].clone().try_into().map(|key| (key, pair[1].clone())))
+                        .try_collect::<_, IndexMap<_, _>, _>()?,
+                ))
+            }),
+            ("map?", &|values| {
+                Ok(Type::Bool(values.first().unwrap().is_hash_map()))
+            }),
+            ("assoc", &|values| {
+                let hash_map = values.first().unwrap().as_hash_map().unwrap();
+                let pairs = values[1..].chunks_exact(2);
+                if let Some(key) = pairs.remainder().first() {
+                    return Err(Error::MissingHashMapValue((*key).clone().try_into()?));
+                }
+                Ok(Type::HashMap(
+                    hash_map
+                        .iter()
+                        .map(|(key, value)| Ok((key.clone(), value.clone())))
+                        .chain(pairs.map(|pair| {
+                            pair[0].clone().try_into().map(|key| (key, pair[1].clone()))
+                        }))
+                        .try_collect::<_, IndexMap<_, _>, _>()?,
+                ))
+            }),
+            ("dissoc", &|values| {
+                let mut hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                let keys = &values[1..];
+                hash_map.retain(|key, _| !keys.contains(&&Type::from(key.clone())));
+                Ok(Type::HashMap(hash_map))
+            }),
+            ("get", &|values| {
+                let Some(hash_map) = values.first().unwrap().as_hash_map().cloned() else {
+                    return Ok(Type::Nil);
+                };
+                let key = HashMapKey::try_from((*values.get(1).unwrap()).clone())?;
+                Ok(hash_map.get(&key).unwrap_or(&Type::Nil).clone())
+            }),
+            ("contains?", &|values| {
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                let key = HashMapKey::try_from((*values.get(1).unwrap()).clone())?;
+                Ok(Type::Bool(hash_map.contains_key(&key)))
+            }),
+            ("keys", &|values| {
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                Ok(Type::List(hash_map.into_keys().map(Into::into).collect()))
+            }),
+            ("vals", &|values| {
+                let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
+                Ok(Type::List(hash_map.into_values().collect()))
+            }),
+        ] as [(&str, &<Function as Deref>::Target); 43]
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
@@ -722,6 +858,31 @@ fn eval(ast: Type, environment: Rc<RefCell<Environment>>) -> Result<EvalResult, 
                             unevaluated.get(1).unwrap(),
                             &environment,
                         )),
+                        Some("try*") => {
+                            match eval(unevaluated.get(1).unwrap().clone(), Rc::clone(&environment))
+                            {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    let mut new = Environment::new();
+                                    new.outer = Some(Rc::clone(&environment));
+                                    let new = Rc::new(RefCell::new(new));
+                                    let catch = unevaluated.get(2);
+                                    if let Some(catch) = catch {
+                                        let catch = catch.as_list().unwrap();
+                                        new.borrow_mut().set(
+                                            catch.get(1).unwrap().as_symbol().unwrap().clone(),
+                                            error
+                                                .as_custom()
+                                                .unwrap_or(&Type::String(error.to_string()))
+                                                .clone(),
+                                        );
+                                        eval(catch.get(2).unwrap().clone(), new)?
+                                    } else {
+                                        return Err(error);
+                                    }
+                                }
+                            }
+                        }
                         _ => {
                             let result = eval_ast(ast.clone(), &environment)?;
                             let evaluated = result.as_result_list().unwrap();
@@ -1082,6 +1243,15 @@ impl TryFrom<Type> for HashMapKey {
     }
 }
 
+impl From<HashMapKey> for Type {
+    fn from(key: HashMapKey) -> Self {
+        match key {
+            HashMapKey::Keyword(keyword) => Self::Keyword(keyword),
+            HashMapKey::String(string) => Self::String(string),
+        }
+    }
+}
+
 #[derive(Clone, EnumAsInner)]
 enum Type {
     List(Vec<Type>),
@@ -1145,7 +1315,7 @@ impl PartialEq for Type {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, EnumAsInner)]
 enum Error {
     #[error("unexpected end-of-file while parsing")]
     UnexpectedEof,
@@ -1163,6 +1333,8 @@ enum Error {
     OutOfRange(usize, String),
     #[error("argument not found when evaluating {0}")]
     ArgumentNotFound(String),
+    #[error("custom error thrown: {}", .0.print(false, false))]
+    Custom(Type),
 }
 
 impl Type {
