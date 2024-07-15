@@ -3,12 +3,15 @@ use clap::Parser;
 use clap::ValueHint;
 use colored::Colorize;
 use core::mem::discriminant;
+use std::io::stdout;
+use std::io::Write;
 use enum_as_inner::EnumAsInner;
 use human_panic::{setup_panic, Metadata};
 use indexmap::IndexMap;
 use itertools::{EitherOrBoth, Itertools};
 use rustyline::{error::ReadlineError, history::FileHistory, DefaultEditor, Editor};
 use std::convert::Into;
+use std::io::stdin;
 use std::{
     cell::RefCell,
     collections::HashMap,
@@ -434,7 +437,24 @@ impl Repl {
                 let hash_map = values.first().unwrap().as_hash_map().unwrap().clone();
                 Ok(Type::List(hash_map.into_values().collect()))
             }),
-        ] as [(&str, &<Function as Deref>::Target); 43]
+            ("readline", &|values| {
+                let mut buffer = String::new();
+                print!("{}", values.first().unwrap().as_string().unwrap());
+                stdout().flush().unwrap();
+                if stdin().read_line(&mut buffer).unwrap() == 0 {
+                    return Ok(Type::Nil);
+                }
+                Ok(Type::String(buffer[..buffer.len() - 1].to_string()))
+            }),
+            ("time-ms", &|_| todo!()),
+            ("meta", &|_| todo!()),
+            ("with-meta", &|_| todo!()),
+            ("fn?", &|_| todo!()),
+            ("string?", &|_| todo!()),
+            ("number?", &|_| todo!()),
+            ("seq", &|_| todo!()),
+            ("conj", &|_| todo!()),
+        ] as [(&str, &<Function as Deref>::Target); 52]
         {
             environment.deref().borrow_mut().set(
                 Token::Other(symbol.to_string()),
@@ -473,6 +493,13 @@ impl Repl {
                 }
             }))),
         );
+        environment
+            .borrow_mut()
+            .set(Token::Other("*ARGV*".to_string()), Type::List(Vec::new()));
+        environment.deref().borrow_mut().set(
+            Token::Other("*host-language*".to_string()),
+            Type::String("Rust".to_string()),
+        );
         Self {
             readline,
             environment,
@@ -496,12 +523,8 @@ impl Repl {
         for line in RC {
             run((*line).to_string()).unwrap();
         }
-        self.environment
-            .borrow_mut()
-            .data
-            .insert(Token::Other("*ARGV*".to_string()), Type::List(Vec::new()));
         if let Some(file) = self.cli.file {
-            self.environment.borrow_mut().data.insert(
+            self.environment.borrow_mut().set(
                 Token::Other("*ARGV*".to_string()),
                 Type::List(
                     self.cli
@@ -511,7 +534,7 @@ impl Repl {
                         .collect(),
                 ),
             );
-            match run(format!("(load-file {})", file.display())) {
+            match run(format!("(load-file \"{}\")", file.display())) {
                 Ok(output) => {
                     println!("{output}");
                 }
@@ -521,6 +544,7 @@ impl Repl {
             }
             return;
         }
+        run(r#"(println (str "Mal [" *host-language* "]"))"#.to_string()).unwrap();
         loop {
             let line = {
                 let green_prompt = concat!(env!("CARGO_PKG_NAME"), " > ").green().to_string();
